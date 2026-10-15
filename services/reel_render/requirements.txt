@@ -1,0 +1,4 @@
+# Only what the render service needs (the full OpenMontage requirements are not required).
+fastapi>=0.110
+uvicorn>=0.29
+pydantic>=2.0

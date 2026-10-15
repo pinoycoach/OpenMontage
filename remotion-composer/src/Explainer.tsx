@@ -840,8 +840,9 @@ export const Explainer: React.FC<ExplainerProps> = (props) => {
 
   return (
     <AbsoluteFill style={{ background: theme.backgroundColor, fontFamily: theme.headingFont || fontFamily }}>
-      {/* Layer 0: Animated gradient background — driven by theme */}
-      <AnimatedBackground theme={theme} />
+      {/* Layer 0: Animated gradient background — driven by theme.
+          plainBackground skips it when full-frame media covers it anyway (it is costly to render). */}
+      {!props.plainBackground && <AnimatedBackground theme={theme} />}
 
       {/* Layer 1: Visual scenes */}
       {cuts.map((cut) => {
@@ -873,8 +874,9 @@ export const Explainer: React.FC<ExplainerProps> = (props) => {
       {captions && captions.length > 0 && (
         <CaptionOverlay
           words={captions}
-          wordsPerPage={6}
-          fontSize={42}
+          wordsPerPage={(props.captionWordsPerPage as number) ?? 6}
+          fontSize={(props.captionFontSize as number) ?? 42}
+          bottomOffset={(props.captionBottomOffset as number) ?? 80}
           color={theme.textColor}
           highlightColor={theme.captionHighlightColor}
           backgroundColor={theme.captionBackgroundColor}
