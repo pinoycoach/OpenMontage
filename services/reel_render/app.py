@@ -6,6 +6,10 @@ returns the rendered H.264 MP4. Captions are word-by-word, timed across each
 scene's window. Only data URLs are accepted, so the service never fetches
 arbitrary URLs.
 
+Captions are timed to the actual speech when faster-whisper is installed (it
+transcribes the voiceover and lines its word timings up with the script), and an
+optional music track is mixed under the voice with automatic ducking.
+
 Run locally from the repo root:
     RENDER_TOKEN=dev uvicorn services.reel_render.app:app --port 8090
 """
@@ -23,6 +27,7 @@ import subprocess
 import tempfile
 import threading
 import uuid
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -34,6 +39,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 COMPOSER_DIR = REPO_ROOT / "remotion-composer"
 RENDER_TOKEN = os.environ.get("RENDER_TOKEN", "")
 RENDER_TIMEOUT_SECONDS = int(os.environ.get("RENDER_TIMEOUT_SECONDS", "840"))
+# "whisper" times captions to the real speech; anything else spreads words evenly per scene.
+CAPTION_SYNC = os.environ.get("CAPTION_SYNC", "whisper")
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")
 MAX_SCENES = 30
 MAX_ASSET_BYTES = 25 * 1024 * 1024
 FPS = 30
@@ -76,6 +84,8 @@ class RenderRequest(BaseModel):
     aspectRatio: Literal["9:16", "16:9"] = "9:16"
     captionStyle: CaptionStyle = "yellow-pop"
     captions: bool = True
+    music: Optional[str] = None
+    musicVolume: float = Field(0.2, ge=0, le=1)
 
 
 app = FastAPI(title="OpenMontage reel render")
@@ -155,11 +165,111 @@ def word_captions(text: str, start: float, end: float) -> list[dict]:
     return out
 
 
+_whisper_model = None
+_whisper_lock = threading.Lock()
+
+
+def transcribe(path: Path) -> Optional[list[tuple[str, float, float]]]:
+    """Word timings heard in the audio, or None when faster-whisper isn't available or fails."""
+    global _whisper_model
+    if CAPTION_SYNC != "whisper":
+        return None
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        return None
+    try:
+        with _whisper_lock:
+            if _whisper_model is None:
+                _whisper_model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+            segments, _ = _whisper_model.transcribe(str(path), word_timestamps=True, beam_size=1)
+            return [(w.word.strip(), float(w.start), float(w.end))
+                    for seg in segments for w in (seg.words or []) if w.word.strip()]
+    except Exception as exc:  # noqa: BLE001 - captions fall back to estimated timing
+        print(f"[reel_render] transcription failed, using estimated caption timing: {exc}")
+        return None
+
+
+def _norm(word: str) -> str:
+    return re.sub(r"[^\w]", "", word.lower())
+
+
+def align_words(script: list[str], heard: list[tuple[str, float, float]],
+                min_match: float = 0.6) -> Optional[list[tuple[float, float]]]:
+    """(start, end) for every script word, taken from the matching heard word.
+    Words Whisper missed or misheard are fitted into the gaps between matched ones.
+    Returns None when too little of the script was recognised to trust."""
+    if not script or not heard:
+        return None
+    times: list[Optional[tuple[float, float]]] = [None] * len(script)
+    matcher = SequenceMatcher(a=[_norm(w) for w in script], b=[_norm(h[0]) for h in heard], autojunk=False)
+    for block in matcher.get_matching_blocks():
+        for k in range(block.size):
+            h = heard[block.b + k]
+            times[block.a + k] = (h[1], h[2])
+    if sum(t is not None for t in times) < min_match * len(script):
+        return None
+    i = 0
+    while i < len(times):
+        if times[i] is not None:
+            i += 1
+            continue
+        j = i
+        while j < len(times) and times[j] is None:
+            j += 1
+        gap_start = times[i - 1][1] if i > 0 else max(0.0, times[j][0] - 0.3 * (j - i))
+        gap_end = times[j][0] if j < len(times) else gap_start + 0.3 * (j - i)
+        step = max(gap_end - gap_start, 0.0) / (j - i)
+        for k in range(i, j):
+            times[k] = (gap_start + step * (k - i), gap_start + step * (k - i + 1))
+        i = j
+    return [t for t in times if t is not None]
+
+
+def timed_spans(word_ranges: list[tuple[int, int]], times: list[tuple[float, float]],
+                min_scene: float = 0.8) -> Optional[list[tuple[float, float]]]:
+    """Scene cuts that land between the last word of one line and the first word of the next,
+    so each picture changes exactly when the narration moves on."""
+    if any(a >= b for a, b in word_ranges):
+        return None
+    bounds = [0.0]
+    for (_, prev_end), (next_start, _) in zip(word_ranges, word_ranges[1:]):
+        bounds.append((times[prev_end - 1][1] + times[next_start][0]) / 2)
+    bounds.append(times[word_ranges[-1][1] - 1][1] + 0.8)
+    spans = [(round(a, 3), round(b, 3)) for a, b in zip(bounds, bounds[1:])]
+    if any(b - a < min_scene for a, b in spans):
+        return None
+    return spans
+
+
+def caption_line(scene: Scene, has_voice: bool) -> str:
+    # With narration, captions follow what is spoken; otherwise show the on-screen text.
+    return (scene.voiceoverLine if has_voice else None) or scene.captionOverlay or ""
+
+
 def build_props(req: RenderRequest, image_paths: list[Path], voice_path: Optional[Path],
-                voice_seconds: Optional[float]) -> dict:
+                voice_seconds: Optional[float],
+                heard: Optional[list[tuple[str, float, float]]] = None) -> dict:
     spans = scene_timeline([s.durationSeconds for s in req.scenes], voice_seconds)
     vertical = req.aspectRatio == "9:16"
+
+    # Exact timing: line the heard words up with the script, then cut scenes between lines.
+    exact: Optional[list[tuple[float, float]]] = None
+    lines = [caption_line(s, bool(voice_path)).split() for s in req.scenes]
+    if voice_path and heard:
+        script = [w for line in lines for w in line]
+        times = align_words(script, heard)
+        if times:
+            ranges, k = [], 0
+            for line in lines:
+                ranges.append((k, k + len(line)))
+                k += len(line)
+            exact_spans = timed_spans(ranges, times)
+            if exact_spans:
+                spans, exact = exact_spans, times
+
     cuts, captions = [], []
+    word_index = 0
     for i, (scene, path, (start, end)) in enumerate(zip(req.scenes, image_paths, spans)):
         motion = scene.cameraMotion or "subtle-pulse"
         cuts.append({
@@ -169,10 +279,15 @@ def build_props(req: RenderRequest, image_paths: list[Path], voice_path: Optiona
             "out_seconds": end,
             "animation": MOTION_MAP.get(motion, motion),
         })
-        if req.captions:
-            # With narration, captions follow what is spoken; otherwise show the on-screen text.
-            line = (scene.voiceoverLine if voice_path else None) or scene.captionOverlay or ""
-            captions.extend(word_captions(line, start, end))
+        words = lines[i]
+        if req.captions and exact:
+            for n, word in enumerate(words):
+                t0, t1 = exact[word_index + n]
+                captions.append({"word": word, "startMs": round(t0 * 1000), "endMs": round(t1 * 1000),
+                                 "pageBreakAfter": n == len(words) - 1})
+        elif req.captions:
+            captions.extend(word_captions(" ".join(words), start, end))
+        word_index += len(words)
 
     props: dict = {
         "cuts": cuts,
@@ -195,7 +310,34 @@ def build_props(req: RenderRequest, image_paths: list[Path], voice_path: Optiona
     }
     if voice_path:
         props["audio"]["narration"] = {"src": voice_path.name, "volume": 1}
+    props["captionTiming"] = "speech" if exact else "estimated"
     return props
+
+
+def mix_music(voice_path: Optional[Path], music_path: Path, total: float, job_dir: Path,
+              volume: float) -> Path:
+    """One soundtrack: the music looped or trimmed to the video, faded in and out, and ducked
+    under the voice (a sidechain compressor lowers it whenever someone speaks)."""
+    out = job_dir / "soundtrack.wav"
+    fmt = "aformat=sample_rates=48000:channel_layouts=stereo"
+    fade_out = max(total - 2.0, 0.0)
+    music_chain = (f"[1:a]{fmt},atrim=0:{total:.2f},volume={volume:.3f},"
+                   f"afade=t=in:d=1,afade=t=out:st={fade_out:.2f}:d=2")
+    if voice_path:
+        graph = (f"[0:a]{fmt},apad=whole_dur={total:.2f},asplit=2[voice][key];"
+                 f"{music_chain}[music];"
+                 "[music][key]sidechaincompress=threshold=0.02:ratio=10:attack=15:release=350[ducked];"
+                 "[voice][ducked]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95[out]")
+        inputs = ["-i", str(voice_path)]
+    else:
+        graph = f"{music_chain},apad=whole_dur={total:.2f}[out]"
+        inputs = ["-f", "lavfi", "-t", f"{total:.2f}", "-i", "anullsrc=r=48000:cl=stereo"]
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", *inputs, "-stream_loop", "-1", "-i", str(music_path),
+           "-filter_complex", graph, "-map", "[out]", "-t", f"{total:.2f}", str(out)]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    if proc.returncode != 0 or not out.exists():
+        raise HTTPException(500, f"Music mix failed: {proc.stderr[-500:]}")
+    return out
 
 
 def render(props: dict, job_dir: Path, aspect: str) -> Path:
@@ -219,6 +361,7 @@ def render(props: dict, job_dir: Path, aspect: str) -> Path:
     return out
 
 
+@app.get("/health")  # Cloud Run reserves paths ending in "z", so /healthz never reaches the app there
 @app.get("/healthz")
 def healthz() -> dict:
     return {"ok": True, "composer": (COMPOSER_DIR / "node_modules").exists()}
@@ -245,7 +388,19 @@ def render_reel(req: RenderRequest, background: BackgroundTasks,
             voice_path.write_bytes(raw)
             voice_seconds = probe_duration(voice_path)
 
-        props = build_props(req, image_paths, voice_path, voice_seconds)
+        music_path = None
+        if req.music:
+            raw, ext = decode_data_url(req.music, "audio/")
+            music_path = job_dir / f"music{ext}"
+            music_path.write_bytes(raw)
+
+        heard = transcribe(voice_path) if voice_path else None
+        props = build_props(req, image_paths, voice_path, voice_seconds, heard)
+        if music_path:
+            # Explainer adds a one-second fade after the last scene.
+            total = max(c["out_seconds"] for c in props["cuts"]) + 1.0
+            soundtrack = mix_music(voice_path, music_path, total, job_dir, req.musicVolume)
+            props["audio"]["narration"] = {"src": soundtrack.name, "volume": 1}
         if not _render_lock.acquire(timeout=5):
             raise HTTPException(429, "Another reel is rendering. Try again in a minute.")
         try:
