@@ -141,3 +141,76 @@ class TestEndpoint:
 
     def test_healthz(self, client):
         assert client.get("/healthz").json()["ok"] is True
+
+
+class TestSpeechTiming:
+    HEARD = [("Stop", 0.0, 0.26), ("scrolling,", 0.26, 0.7), ("this", 0.96, 1.08), ("changes", 1.08, 1.44),
+             ("everything.", 1.44, 2.04), ("Here", 2.3, 2.5), ("is", 2.5, 2.6), ("why.", 2.6, 3.0)]
+
+    def test_align_uses_heard_times(self):
+        times = rr.align_words(["Stop", "scrolling", "this", "changes", "everything"], self.HEARD[:5])
+        assert times[0] == (0.0, 0.26) and times[-1] == (1.44, 2.04)
+
+    def test_align_fills_misheard_words(self):
+        heard = [("Stop", 0.0, 0.3), ("scroll", 0.3, 0.7), ("this", 1.0, 1.1), ("changes", 1.1, 1.4), ("everything", 1.4, 2.0)]
+        times = rr.align_words(["Stop", "scrolling", "this", "changes", "everything"], heard)
+        assert len(times) == 5
+        assert 0.3 <= times[1][0] <= times[1][1] <= 1.0  # fitted between its neighbours
+
+    def test_align_rejects_unrelated_audio(self):
+        assert rr.align_words(["one", "two", "three", "four"], [("hello", 0, 1), ("world", 1, 2)]) is None
+
+    def test_timed_spans_cut_between_lines(self):
+        times = [(0.0, 0.5), (0.5, 1.0), (1.4, 1.8), (1.8, 2.2)]
+        assert rr.timed_spans([(0, 2), (2, 4)], times) == [(0.0, 1.2), (1.2, 3.0)]
+        assert rr.timed_spans([(0, 2), (2, 2)], times) is None  # a scene with no words
+
+    def test_build_props_with_speech(self, tmp_path: Path):
+        req = _request()  # scene lines: "Stop scrolling now" / "Here is why"
+        heard = [("Stop", 0.0, 0.3), ("scrolling", 0.3, 0.8), ("now.", 0.8, 1.1),
+                 ("Here", 1.6, 1.8), ("is", 1.8, 1.9), ("why.", 1.9, 2.3)]
+        props = rr.build_props(req, [tmp_path / "a.png"] * 2, tmp_path / "voiceover.wav", 2.4, heard)
+        assert props["captionTiming"] == "speech"
+        assert [(c["in_seconds"], c["out_seconds"]) for c in props["cuts"]] == [(0.0, 1.35), (1.35, 3.1)]
+        assert props["captions"][3] == {"word": "Here", "startMs": 1600, "endMs": 1800, "pageBreakAfter": False}
+
+    def test_build_props_falls_back_to_estimates(self, tmp_path: Path):
+        props = rr.build_props(_request(), [tmp_path / "a.png"] * 2, tmp_path / "v.wav", 4.0, None)
+        assert props["captionTiming"] == "estimated"
+
+
+class TestMusic:
+    def _tone(self, path: Path, seconds: float, freq: int) -> Path:
+        import subprocess
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                        f"sine=frequency={freq}:duration={seconds}", str(path)], check=True)
+        return path
+
+    def test_mix_with_voice_has_full_length(self, tmp_path: Path):
+        voice = self._tone(tmp_path / "v.wav", 2, 440)
+        music = self._tone(tmp_path / "m.wav", 1, 220)  # shorter than the video: must loop
+        out = rr.mix_music(voice, music, 5.0, tmp_path, 0.2)
+        assert abs(rr.probe_duration(out) - 5.0) < 0.1
+
+    def test_mix_without_voice(self, tmp_path: Path):
+        music = self._tone(tmp_path / "m.wav", 8, 220)
+        out = rr.mix_music(None, music, 4.0, tmp_path, 0.5)
+        assert abs(rr.probe_duration(out) - 4.0) < 0.1
+
+    def test_endpoint_accepts_music(self, monkeypatch, tmp_path: Path):
+        monkeypatch.setattr(rr, "RENDER_TOKEN", "secret")
+        seen = {}
+
+        def fake_render(props, job_dir, aspect):
+            seen["audio"] = props["audio"]
+            out = job_dir / "reel.mp4"
+            out.write_bytes(b"mp4")
+            return out
+
+        monkeypatch.setattr(rr, "render", fake_render)
+        tone = self._tone(tmp_path / "m.wav", 1, 220).read_bytes()
+        music_url = "data:audio/wav;base64," + base64.b64encode(tone).decode()
+        body = {"scenes": [{"image": PNG_URL, "durationSeconds": 2}], "music": music_url}
+        res = TestClient(rr.app).post("/render", json=body, headers={"Authorization": "Bearer secret"})
+        assert res.status_code == 200
+        assert seen["audio"]["narration"]["src"] == "soundtrack.wav"

@@ -18,6 +18,8 @@ It only renders. It calls no paid AI APIs, so it only costs Cloud Run CPU time.
   "captionStyle": "yellow-pop",
   "captions": true,
   "voiceover": "data:audio/wav;base64,...",
+  "music": "data:audio/mpeg;base64,...",
+  "musicVolume": 0.2,
   "scenes": [
     { "image": "data:image/jpeg;base64,...", "durationSeconds": 3,
       "cameraMotion": "zoom-in", "captionOverlay": "HOOK", "voiceoverLine": "Stop scrolling." }
@@ -26,8 +28,20 @@ It only renders. It calls no paid AI APIs, so it only costs Cloud Run CPU time.
 ```
 
 It returns `video/mp4`. Assets must be base64 data URLs, so the service never fetches
-outside URLs. With a voiceover, the captions follow `voiceoverLine` and scenes stretch to fit
-the voice. Without one, the captions show `captionOverlay`. `GET /healthz` is a health check.
+outside URLs.
+
+- **With a voiceover**, the captions follow `voiceoverLine`. The service transcribes the voice with
+  faster-whisper and lines the heard word timings up with the script. Each word lights up when
+  it's spoken, and each scene cuts between the end of one line and the start of the next. If
+  transcription fails, or doesn't match the script well enough, it falls back to spreading the
+  words evenly across each scene, which is then stretched to fit the voice.
+- **Without a voiceover**, the captions show `captionOverlay`.
+- **`music`** (optional) is looped or trimmed to the video and faded in and out. It's ducked under
+  the voice, so a sidechain compressor lowers it while someone speaks. `musicVolume` (0–1,
+  default 0.2) sets its level before ducking.
+
+`GET /health` is a health check. Cloud Run reserves paths ending in "z", so `/healthz` only works
+locally. `CAPTION_SYNC=off` turns off the speech timing.
 
 Run locally from the repo root:
 
@@ -73,5 +87,6 @@ Then turn it on in ViralReel Studio. See that repo's README, section "HD Reel ex
 
 ## Speed
 
-In testing, a 10-second reel took about 27 seconds on 4 CPUs. Render time grows with reel
+In testing, a 10-second reel took about 27 seconds on 4 CPUs, plus a few seconds to transcribe
+the voice. Render time grows with reel
 length, so a 45-second reel takes roughly 2 minutes.
