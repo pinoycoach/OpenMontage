@@ -1,0 +1,11 @@
+# Keeps container builds (services/reel_render) small and free of local secrets.
+.git
+.env
+*.env
+.venv
+venv
+**/node_modules
+**/__pycache__
+projects
+remotion-composer/out
+remotion-composer/projects

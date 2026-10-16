@@ -30,6 +30,8 @@ type CaptionOverlayProps = {
   // Separator rendered between words. Space-delimited languages want the
   // default " "; CJK languages (no inter-word spacing) should pass "".
   wordSeparator?: string;
+  // Distance from the bottom edge in px. Vertical reels want captions above the app UI.
+  bottomOffset?: number;
 };
 
 interface CaptionPage {
@@ -66,7 +68,8 @@ const PageRenderer: React.FC<{
   backgroundColor: string;
   fontFamily: string;
   wordSeparator: string;
-}> = ({ page, fontSize, color, highlightColor, backgroundColor, fontFamily, wordSeparator }) => {
+  bottomOffset: number;
+}> = ({ page, fontSize, color, highlightColor, backgroundColor, fontFamily, wordSeparator, bottomOffset }) => {
   const frame = useCurrentFrame();
   const { fps } = useVideoConfig();
 
@@ -84,7 +87,7 @@ const PageRenderer: React.FC<{
       style={{
         justifyContent: "flex-end",
         alignItems: "center",
-        paddingBottom: 80,
+        paddingBottom: bottomOffset,
       }}
     >
       <div
@@ -147,6 +150,7 @@ export const CaptionOverlay: React.FC<CaptionOverlayProps> = ({
   backgroundColor = "rgba(15, 23, 42, 0.75)",
   fontFamily = "Space Grotesk, Inter, system-ui, sans-serif",
   wordSeparator = " ",
+  bottomOffset = 80,
 }) => {
   const { fps } = useVideoConfig();
   const pages = buildPages(words, wordsPerPage);
@@ -171,6 +175,7 @@ export const CaptionOverlay: React.FC<CaptionOverlayProps> = ({
               backgroundColor={backgroundColor}
               fontFamily={fontFamily}
               wordSeparator={wordSeparator}
+              bottomOffset={bottomOffset}
             />
           </Sequence>
         );
