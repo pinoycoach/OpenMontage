@@ -14,8 +14,18 @@ export interface ReelCardData {
 }
 
 const ACCENTS = { stat: "#FDE047", list: "#F472B6", quote: "#A78BFA", compare: "#38BDF8", end: "#F472B6" } as const;
-// Compare: the first side reads as the "wrong / before" one, the second as the "right / after" one.
-const SIDE_COLORS = ["#FB7185", "#34D399"] as const;
+// Compare: a judgement pair (myth/fact, wrong/right, before/after) is red ✕ then green ✓; any other
+// pair (e.g. two age groups) gets neutral colours and no icons, so neither side looks "wrong".
+const JUDGED_COLORS = ["#FB7185", "#34D399"] as const;
+const NEUTRAL_COLORS = ["#F472B6", "#38BDF8"] as const;
+const JUDGED_LABEL = /^(myth|wrong|false|before|don'?t|bad|old way|mistake|avoid|fiction|lie|no)$/i;
+
+// Drawn as SVG: the renderer's fonts have no ✕/✓ glyphs.
+const Mark: React.FC<{ ok: boolean; color: string }> = ({ ok, color }) => (
+  <svg width="38" height="38" viewBox="0 0 24 24" style={{ marginRight: 14, flexShrink: 0 }}>
+    <path d={ok ? "M4 12.5l5 5L20 6.5" : "M6 6l12 12M18 6L6 18"} stroke={color} strokeWidth="3.4" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+  </svg>
+);
 const FONT = '"Inter", "Helvetica Neue", Arial, sans-serif';
 const SIDE = 128;
 // Content sits in the upper two thirds; the bottom is left for captions and the platform's buttons.
@@ -177,6 +187,8 @@ const Compare: React.FC<{ card: ReelCardData }> = ({ card }) => {
   const frame = useCurrentFrame();
   const { fps } = useVideoConfig();
   const sides = (card.items || []).slice(0, 2).map(splitSide);
+  const judged = JUDGED_LABEL.test(sides[0]?.label || "");
+  const colors = judged ? JUDGED_COLORS : NEUTRAL_COLORS;
   const start = card.title ? Math.round(fps * 0.35) : 0;
   const second = start + Math.round(fps * 0.9);
   return (
@@ -188,7 +200,7 @@ const Compare: React.FC<{ card: ReelCardData }> = ({ card }) => {
       )}
       {sides.map((side, i) => {
         const t = spring({ frame: frame - (i === 0 ? start : second), fps, config: { damping: 16, stiffness: 120 } });
-        const color = SIDE_COLORS[i];
+        const color = colors[i];
         return (
           <React.Fragment key={i}>
             {i === 1 && (
@@ -196,8 +208,9 @@ const Compare: React.FC<{ card: ReelCardData }> = ({ card }) => {
             )}
             <div style={{ borderRadius: 36, padding: "40px 48px", background: `${color}1F`, border: `4px solid ${color}`, opacity: t, transform: `translateX(${interpolate(t, [0, 1], [i === 0 ? -90 : 90, 0])}px)` }}>
               {side.label && (
-                <div style={{ color, fontWeight: 800, fontSize: 46, letterSpacing: 2, textTransform: "uppercase", marginBottom: 14 }}>
-                  {i === 0 ? "✕ " : "✓ "}{side.label}
+                <div style={{ color, fontWeight: 800, fontSize: 46, letterSpacing: 2, textTransform: "uppercase", marginBottom: 14, display: "flex", alignItems: "center" }}>
+                  {judged && <Mark ok={i === 1} color={color} />}
+                  {side.label}
                 </div>
               )}
               <div style={{ color: "#F8FAFC", fontWeight: 700, fontSize: sizeFor(side.text, 70, 46, 0.6, 22), lineHeight: 1.2 }}>{side.text}</div>
