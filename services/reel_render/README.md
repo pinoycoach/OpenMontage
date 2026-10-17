@@ -108,6 +108,19 @@ gcloud run services update openmontage-render --region $REGION --update-secrets 
 
 fal bills about $0.02 per second of talking clip, charged to the fal account, not Google Cloud.
 
+## Clips (long video → short vertical clips)
+
+For the app's Clips tab. The source is a Google Drive file shared as "Anyone with the link".
+
+- `POST /clips/transcribe {driveUrl}` downloads the video (cached on the instance), transcribes
+  it and returns `{duration, segments: [{start, end, text}]}`. The app picks the moments.
+- `POST /clips/render {driveUrl, start, end, captionStyle}` cuts that span, finds the speaker's
+  face (OpenCV) and crops to 9:16 around it, then adds word-by-word captions from the speech.
+
+Limits: `MAX_SOURCE_MINUTES` (default 90), `MAX_SOURCE_MB` (default 3000), clips up to 90 s.
+Downloaded videos live in memory on Cloud Run, so give the service 8 GiB for long sources:
+`gcloud run services update openmontage-render --region $REGION --memory 8Gi`.
+
 ## Speed
 
 In testing, a 10-second reel took about 27 seconds on 4 CPUs, plus a few seconds to transcribe
