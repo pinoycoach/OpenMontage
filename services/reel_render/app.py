@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Literal, Optional
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -547,6 +547,17 @@ def add_talking_scenes(props: dict, req: RenderRequest, job_dir: Path, voice_pat
     return talked
 
 
+def video_response(path: Path, filename: str, headers: Optional[dict] = None) -> StreamingResponse:
+    """Send the MP4 in chunks, without Content-Length. Cloud Run refuses a response sent in one
+    piece if it's over 32 MB, and reels with motion or talking clips can be larger than that."""
+    def chunks():
+        with path.open("rb") as f:
+            while chunk := f.read(1024 * 1024):
+                yield chunk
+    return StreamingResponse(chunks(), media_type="video/mp4", headers={
+        "Content-Disposition": f'attachment; filename="{filename}"', **(headers or {})})
+
+
 def render(props: dict, job_dir: Path, aspect: str) -> Path:
     width, height = (1080, 1920) if aspect == "9:16" else (1920, 1080)
     props_path = job_dir / "props.json"
@@ -577,7 +588,7 @@ def healthz() -> dict:
 
 @app.post("/render")
 def render_reel(req: RenderRequest, background: BackgroundTasks,
-                authorization: Optional[str] = Header(None)) -> FileResponse:
+                authorization: Optional[str] = Header(None)) -> StreamingResponse:
     _check_token(authorization)
     job_dir = Path(tempfile.mkdtemp(prefix=f"reel-{uuid.uuid4().hex[:8]}-"))
     background.add_task(shutil.rmtree, job_dir, ignore_errors=True)
@@ -628,7 +639,7 @@ def render_reel(req: RenderRequest, background: BackgroundTasks,
         headers["X-Talking-Scenes"] = f"{talked}/{len(set(req.talkingScenes))}"
     if req.motionScenes:
         headers["X-Motion-Scenes"] = f"{moved}/{len(set(req.motionScenes))}"
-    return FileResponse(out, media_type="video/mp4", filename="reel-hd.mp4", headers=headers or None)
+    return video_response(out, "reel-hd.mp4", headers)
 
 
 # ---------------------------------------------------------------------------
@@ -788,7 +799,7 @@ def clip_captions(heard: list[tuple[str, float, float]]) -> list[dict]:
 
 @app.post("/clips/render")
 def clips_render(req: ClipRenderRequest, background: BackgroundTasks,
-                 authorization: Optional[str] = Header(None)) -> FileResponse:
+                 authorization: Optional[str] = Header(None)) -> StreamingResponse:
     _check_token(authorization)
     if req.end - req.start > MAX_CLIP_SECONDS or req.end <= req.start:
         raise HTTPException(400, f"A clip must be between 1 and {MAX_CLIP_SECONDS} seconds.")
@@ -839,4 +850,4 @@ def clips_render(req: ClipRenderRequest, background: BackgroundTasks,
     except Exception:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise
-    return FileResponse(out, media_type="video/mp4", filename="clip.mp4")
+    return video_response(out, "clip.mp4")
