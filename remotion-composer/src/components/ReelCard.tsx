@@ -24,8 +24,12 @@ const BOTTOM = 1330;
 const sizeFor = (text: string, max: number, min: number, perChar: number, freeChars: number) =>
   Math.max(min, Math.min(max, max - (text.length - freeChars) * perChar));
 
+// A bare year ("2023") is a date, not an amount: show it as is instead of counting up.
+const YEAR_RE = /^\s*(1[5-9]|20)\d{2}\s*$/;
+
 // "8.1B" -> {prefix:"", value:8.1, decimals:1, suffix:"B"}; null when there's no number to count.
 export const parseStat = (stat: string) => {
+  if (YEAR_RE.test(stat)) return null;
   const m = stat.match(/^([^\d-]*)(-?\d[\d,]*(?:\.\d+)?)(.*)$/);
   if (!m) return null;
   const digits = m[2].replace(/,/g, "");
