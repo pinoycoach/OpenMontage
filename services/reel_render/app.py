@@ -525,3 +525,214 @@ def render_reel(req: RenderRequest, background: BackgroundTasks,
         raise
     headers = {"X-Talking-Scenes": f"{talked}/{len(set(req.talkingScenes))}"} if req.talkingScenes else None
     return FileResponse(out, media_type="video/mp4", filename="reel-hd.mp4", headers=headers)
+
+
+# ---------------------------------------------------------------------------
+# Clips: long video (Google Drive link) -> transcript -> vertical, captioned short clips.
+# The app picks the moments from the transcript; this service downloads, transcribes and cuts.
+# ---------------------------------------------------------------------------
+
+CLIP_CACHE = Path(os.environ.get("CLIP_CACHE", "/tmp/clip-sources"))
+MAX_SOURCE_BYTES = int(os.environ.get("MAX_SOURCE_MB", "3000")) * 1024 * 1024
+MAX_SOURCE_MINUTES = float(os.environ.get("MAX_SOURCE_MINUTES", "90"))
+MAX_CLIP_SECONDS = 90
+DRIVE_ID_RE = re.compile(r"(?:/d/|[?&]id=)([A-Za-z0-9_-]{20,})")
+_source_locks: dict[str, threading.Lock] = {}
+_source_locks_guard = threading.Lock()
+
+
+def drive_file_id(url: str) -> str:
+    """The file id in a Google Drive share link (…/file/d/<id>/view or …?id=<id>)."""
+    match = DRIVE_ID_RE.search(url or "")
+    if not match:
+        raise HTTPException(400, "That doesn't look like a Google Drive file link.")
+    return match.group(1)
+
+
+def _download_drive(file_id: str, dest: Path) -> None:
+    url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t"
+    tmp = dest.with_suffix(".part")
+    try:
+        with urllib.request.urlopen(url, timeout=60) as resp:
+            if "text/html" in (resp.headers.get("Content-Type") or ""):
+                raise HTTPException(400, "Google Drive didn't send the video. Share it as "
+                                         "\"Anyone with the link\" and try again.")
+            size = 0
+            with tmp.open("wb") as out:
+                while chunk := resp.read(1024 * 1024):
+                    size += len(chunk)
+                    if size > MAX_SOURCE_BYTES:
+                        raise HTTPException(400, f"That video is over {MAX_SOURCE_BYTES // (1024 * 1024)} MB.")
+                    out.write(chunk)
+        tmp.rename(dest)
+    except urllib.error.HTTPError as exc:
+        raise HTTPException(400, f"Google Drive refused the download ({exc.code}). "
+                                 "Check the link is shared as \"Anyone with the link\".") from exc
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def source_video(drive_url: str) -> Path:
+    """The Drive video on local disk, downloaded once per instance and reused for every clip."""
+    file_id = drive_file_id(drive_url)
+    with _source_locks_guard:
+        lock = _source_locks.setdefault(file_id, threading.Lock())
+    with lock:
+        CLIP_CACHE.mkdir(parents=True, exist_ok=True)
+        path = CLIP_CACHE / f"{file_id}.video"
+        if not path.exists():
+            _download_drive(file_id, path)
+        return path
+
+
+def transcribe_segments(path: Path) -> list[dict]:
+    """Sentence-ish segments with start/end times for a long recording."""
+    from faster_whisper import WhisperModel
+    global _whisper_model
+    with _whisper_lock:
+        if _whisper_model is None:
+            _whisper_model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+        segments, _ = _whisper_model.transcribe(str(path), beam_size=1, vad_filter=True)
+        return [{"start": round(s.start, 2), "end": round(s.end, 2), "text": s.text.strip()}
+                for s in segments if s.text.strip()]
+
+
+class ClipSourceRequest(BaseModel):
+    driveUrl: str
+
+
+class ClipRenderRequest(BaseModel):
+    driveUrl: str
+    start: float = Field(ge=0)
+    end: float = Field(gt=0)
+    captionStyle: CaptionStyle = "yellow-pop"
+    captions: bool = True
+
+
+@app.post("/clips/transcribe")
+def clips_transcribe(req: ClipSourceRequest, authorization: Optional[str] = Header(None)) -> dict:
+    _check_token(authorization)
+    src = source_video(req.driveUrl)
+    duration = probe_duration(src)
+    if not duration:
+        raise HTTPException(400, "That file isn't a video we can read.")
+    if duration > MAX_SOURCE_MINUTES * 60:
+        raise HTTPException(400, f"That video is over {int(MAX_SOURCE_MINUTES)} minutes.")
+    with tempfile.TemporaryDirectory(prefix="clipsrc-") as tmp:
+        audio = Path(tmp) / "audio.wav"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(src), "-vn", "-ac", "1", "-ar", "16000",
+                        str(audio)], check=True, capture_output=True, timeout=600)
+        segments = transcribe_segments(audio)
+    return {"duration": round(duration, 2), "segments": segments}
+
+
+def probe_size(path: Path) -> tuple[int, int]:
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                          "stream=width,height", "-of", "csv=p=0", str(path)],
+                         capture_output=True, text=True, timeout=30).stdout.strip()
+    width, height = (int(v) for v in out.split(",")[:2])
+    return width, height
+
+
+def face_center_x(clip: Path, duration: float, samples: int = 8) -> Optional[float]:
+    """Where the speaker's face sits across the clip, as a 0-1 fraction of the width (median of a
+    few sampled frames). None when OpenCV isn't installed or no face is found."""
+    try:
+        import cv2
+    except ImportError:
+        return None
+    cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    centers = []
+    with tempfile.TemporaryDirectory(prefix="faces-") as tmp:
+        for i in range(samples):
+            frame = Path(tmp) / f"f{i}.jpg"
+            t = duration * (i + 0.5) / samples
+            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{t:.2f}", "-i", str(clip),
+                            "-frames:v", "1", "-vf", "scale=640:-2", str(frame)], capture_output=True, timeout=60)
+            img = cv2.imread(str(frame))
+            if img is None:
+                continue
+            faces = cascade.detectMultiScale(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), 1.1, 5, minSize=(40, 40))
+            if len(faces):
+                x, _, w, _ = max(faces, key=lambda f: f[2] * f[3])
+                centers.append((x + w / 2) / img.shape[1])
+    if not centers:
+        return None
+    centers.sort()
+    return centers[len(centers) // 2]
+
+
+def vertical_crop(src_w: int, src_h: int, center_x: Optional[float]) -> tuple[int, int, int, int]:
+    """(w, h, x, y) of the largest 9:16 window, centred on the face when known."""
+    w, h = src_w, src_h
+    if src_w / src_h > 9 / 16:
+        w = int(src_h * 9 / 16) // 2 * 2
+    else:
+        h = int(src_w * 16 / 9) // 2 * 2
+    cx = (center_x if center_x is not None else 0.5) * src_w
+    x = int(min(max(cx - w / 2, 0), src_w - w))
+    y = (src_h - h) // 2
+    return w, h, x, y
+
+
+def clip_captions(heard: list[tuple[str, float, float]]) -> list[dict]:
+    """Word captions straight from what was heard; a page ends after each sentence."""
+    return [{"word": word, "startMs": round(start * 1000), "endMs": round(end * 1000),
+             "pageBreakAfter": bool(re.search(r"[.!?]$", word))}
+            for word, start, end in heard]
+
+
+@app.post("/clips/render")
+def clips_render(req: ClipRenderRequest, background: BackgroundTasks,
+                 authorization: Optional[str] = Header(None)) -> FileResponse:
+    _check_token(authorization)
+    if req.end - req.start > MAX_CLIP_SECONDS or req.end <= req.start:
+        raise HTTPException(400, f"A clip must be between 1 and {MAX_CLIP_SECONDS} seconds.")
+    src = source_video(req.driveUrl)
+    job_dir = Path(tempfile.mkdtemp(prefix=f"clip-{uuid.uuid4().hex[:8]}-"))
+    background.add_task(shutil.rmtree, job_dir, ignore_errors=True)
+    try:
+        cut, audio = job_dir / "cut.mp4", job_dir / "audio.wav"
+        span = ["-ss", f"{req.start:.2f}", "-to", f"{req.end:.2f}", "-i", str(src)]
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", *span, "-an", "-c:v", "libx264",
+                        "-preset", "veryfast", "-crf", "20", str(cut)], check=True, capture_output=True, timeout=600)
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", *span, "-vn", "-ac", "2", "-ar", "48000",
+                        str(audio)], check=True, capture_output=True, timeout=300)
+        duration = probe_duration(cut) or (req.end - req.start)
+        src_w, src_h = probe_size(cut)
+        w, h, x, y = vertical_crop(src_w, src_h, face_center_x(cut, duration))
+        vertical = job_dir / "clip.mp4"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(cut), "-vf",
+                        f"crop={w}:{h}:{x}:{y},scale=1080:1920", "-c:v", "libx264", "-preset", "veryfast",
+                        "-crf", "20", str(vertical)], check=True, capture_output=True, timeout=600)
+        heard = transcribe(audio) if req.captions else None
+        props = {
+            "cuts": [{"id": "clip", "source": vertical.name, "in_seconds": 0, "out_seconds": duration}],
+            "overlays": [],
+            "captions": clip_captions(heard or []),
+            "audio": {"narration": {"src": audio.name, "volume": 1}},
+            "plainBackground": True,
+            "captionFontSize": 76,
+            "captionWordsPerPage": 4,
+            "captionBottomOffset": 460,
+            "themeConfig": {
+                "backgroundColor": "#000000",
+                "surfaceColor": "#000000",
+                "textColor": "#FFFFFF",
+                "captionHighlightColor": CAPTION_COLORS[req.captionStyle],
+                "captionBackgroundColor": "rgba(0, 0, 0, 0.7)",
+            },
+        }
+        if not _render_lock.acquire(timeout=5):
+            raise HTTPException(429, "Another video is rendering. Try again in a minute.")
+        try:
+            out = render(props, job_dir, "9:16")
+        finally:
+            _render_lock.release()
+    except subprocess.CalledProcessError as exc:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(500, f"Cutting the clip failed: {(exc.stderr or b'')[-300:]!r}") from exc
+    except Exception:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise
+    return FileResponse(out, media_type="video/mp4", filename="clip.mp4")

@@ -360,3 +360,44 @@ class TestTalkingScenes:
         monkeypatch.setattr(rr.urllib.request, "urlopen", fake_urlopen)
         with pytest.raises(RuntimeError, match=r"fal HTTP 422: .*image_url"):
             rr._fal_json("https://queue.fal.run/x", {"a": 1})
+
+
+class TestClips:
+    def test_drive_file_id(self):
+        fid = "1AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+        assert rr.drive_file_id(f"https://drive.google.com/file/d/{fid}/view?usp=sharing") == fid
+        assert rr.drive_file_id(f"https://drive.google.com/open?id={fid}") == fid
+        with pytest.raises(HTTPException):
+            rr.drive_file_id("https://youtube.com/watch?v=abc")
+
+    def test_vertical_crop_follows_face(self):
+        assert rr.vertical_crop(1920, 1080, None) == (606, 1080, 657, 0)       # centre
+        assert rr.vertical_crop(1920, 1080, 0.15) == (606, 1080, 0, 0)        # face at far left: clamp
+        assert rr.vertical_crop(1920, 1080, 0.75) == (606, 1080, 1137, 0)
+        assert rr.vertical_crop(1080, 1920, 0.5) == (1080, 1920, 0, 0)        # already vertical
+
+    def test_clip_captions_break_after_sentences(self):
+        caps = rr.clip_captions([("Hello", 0.0, 0.4), ("there.", 0.4, 0.9), ("Next", 1.2, 1.5)])
+        assert [c["pageBreakAfter"] for c in caps] == [False, True, False]
+        assert caps[1]["startMs"] == 400 and caps[1]["endMs"] == 900
+
+    def test_render_rejects_bad_spans(self, monkeypatch):
+        monkeypatch.setattr(rr, "RENDER_TOKEN", "secret")
+        c = TestClient(rr.app)
+        h = {"Authorization": "Bearer secret"}
+        assert c.post("/clips/render", json={"driveUrl": "x", "start": 10, "end": 5}, headers=h).status_code == 400
+        assert c.post("/clips/render", json={"driveUrl": "x", "start": 0, "end": 200}, headers=h).status_code == 400
+        assert c.post("/clips/transcribe", json={"driveUrl": "x"}).status_code == 401
+
+    def test_drive_html_page_is_explained(self, tmp_path: Path, monkeypatch):
+        class HtmlResp:
+            headers = {"Content-Type": "text/html; charset=utf-8"}
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self, n=-1): return b""
+
+        monkeypatch.setattr(rr.urllib.request, "urlopen", lambda url, timeout=0: HtmlResp())
+        with pytest.raises(HTTPException) as exc:
+            rr._download_drive("abc", tmp_path / "v.video")
+        assert "Anyone with the link" in exc.value.detail
+        assert not (tmp_path / "v.video").exists()
