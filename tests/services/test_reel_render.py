@@ -214,3 +214,94 @@ class TestMusic:
         res = TestClient(rr.app).post("/render", json=body, headers={"Authorization": "Bearer secret"})
         assert res.status_code == 200
         assert seen["audio"]["narration"]["src"] == "soundtrack.wav"
+
+
+class TestTalkingScenes:
+    def _tone(self, path: Path, seconds: float) -> Path:
+        import subprocess
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                        f"sine=frequency=300:duration={seconds}", str(path)], check=True)
+        return path
+
+    def _props(self, tmp_path: Path) -> dict:
+        req = _request()
+        return rr.build_props(req, [tmp_path / "scene-1.png", tmp_path / "scene-2.png"],
+                              tmp_path / "voiceover.wav", 4.0)
+
+    def test_swaps_scenes_and_keeps_image_on_failure(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setattr(rr, "FAL_KEY", "k")
+        voice = self._tone(tmp_path / "voiceover.wav", 4)
+        calls = []
+
+        def fake_clip(face, voice_path, start, end, out, deadline):
+            calls.append((out.name, start, end))
+            if out.name == "talk-2.mp4":
+                raise TimeoutError("slow")
+            out.write_bytes(b"mp4")
+            return out
+
+        monkeypatch.setattr(rr, "talking_clip", fake_clip)
+        props = self._props(tmp_path)
+        req = _request(talkingImage=PNG_URL, talkingScenes=[0, 1, 7])
+        assert rr.add_talking_scenes(props, req, tmp_path, voice) == 1
+        assert props["cuts"][0]["source"] == "talk-1.mp4"
+        assert props["cuts"][1]["source"] == "scene-2.png"  # failed clip keeps the image
+        assert sorted(c[0] for c in calls) == ["talk-1.mp4", "talk-2.mp4"]  # index 7 ignored
+        assert ("talk-1.mp4", 0.0, 2.0) in calls
+
+    def test_off_without_key_or_voice(self, tmp_path: Path, monkeypatch):
+        props = self._props(tmp_path)
+        req = _request(talkingImage=PNG_URL, talkingScenes=[0])
+        monkeypatch.setattr(rr, "FAL_KEY", "")
+        assert rr.add_talking_scenes(props, req, tmp_path, tmp_path / "v.wav") == 0
+        monkeypatch.setattr(rr, "FAL_KEY", "k")
+        assert rr.add_talking_scenes(props, req, tmp_path, None) == 0
+        assert props["cuts"][0]["source"] == "scene-1.png"
+
+    def test_talking_clip_cuts_audio_and_polls_fal(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setattr(rr, "FAL_KEY", "k")
+        monkeypatch.setattr(rr.time, "sleep", lambda s: None)
+        voice = self._tone(tmp_path / "voice.wav", 5)
+        face = tmp_path / "face.jpg"
+        face.write_bytes(PNG_1PX)
+        sent, statuses = {}, iter(["IN_QUEUE", "IN_PROGRESS", "COMPLETED"])
+
+        def fake_json(url, body=None, timeout=60):
+            if body is not None:
+                sent.update(body)
+                return {"status_url": "https://q/status", "response_url": "https://q/result"}
+            if url.endswith("/status"):
+                return {"status": next(statuses)}
+            return {"video": {"url": "https://cdn/clip.mp4"}}
+
+        class FakeResp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return b"clip-bytes"
+
+        monkeypatch.setattr(rr, "_fal_json", fake_json)
+        monkeypatch.setattr(rr.urllib.request, "urlopen", lambda url, timeout=0: FakeResp())
+        out = rr.talking_clip(face, voice, 1.0, 3.0, tmp_path / "talk-1.mp4", rr.time.monotonic() + 60)
+        assert out.read_bytes() == b"clip-bytes"
+        assert sent["image_url"].startswith("data:image/jpeg;base64,")
+        assert sent["audio_url"].startswith("data:audio/mpeg;base64,")
+        assert abs(rr.probe_duration(tmp_path / "talk-1.mp3") - 2.0) < 0.1  # just the scene's stretch
+
+    def test_endpoint_reports_talking_header(self, monkeypatch, tmp_path: Path):
+        monkeypatch.setattr(rr, "RENDER_TOKEN", "secret")
+        monkeypatch.setattr(rr, "transcribe", lambda p: None)
+        monkeypatch.setattr(rr, "add_talking_scenes", lambda props, req, job_dir, voice: 1)
+
+        def fake_render(props, job_dir, aspect):
+            out = job_dir / "reel.mp4"
+            out.write_bytes(b"mp4")
+            return out
+
+        monkeypatch.setattr(rr, "render", fake_render)
+        tone = self._tone(tmp_path / "v.wav", 2).read_bytes()
+        body = {"scenes": [{"image": PNG_URL, "durationSeconds": 2}],
+                "voiceover": "data:audio/wav;base64," + base64.b64encode(tone).decode(),
+                "talkingImage": PNG_URL, "talkingScenes": [0]}
+        res = TestClient(rr.app).post("/render", json=body, headers={"Authorization": "Bearer secret"})
+        assert res.status_code == 200
+        assert res.headers["x-talking-scenes"] == "1/1"
