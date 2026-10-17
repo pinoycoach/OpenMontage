@@ -351,9 +351,10 @@ def mix_music(voice_path: Optional[Path], music_path: Path, total: float, job_di
     return out
 
 
-def _fal_json(url: str, body: Optional[dict] = None, timeout: int = 60) -> dict:
+def _fal_json(url: str, body: Optional[dict] = None, timeout: int = 60, method: Optional[str] = None) -> dict:
     data = json.dumps(body).encode() if body is not None else None
-    request = urllib.request.Request(url, data=data, method="POST" if data else "GET", headers={
+    method = method or ("POST" if data else "GET")
+    request = urllib.request.Request(url, data=data, method=method, headers={
         "Authorization": f"Key {FAL_KEY}", "Content-Type": "application/json"})
     with urllib.request.urlopen(request, timeout=timeout) as resp:
         return json.loads(resp.read().decode())
@@ -382,7 +383,12 @@ def talking_clip(face: Path, voice: Path, start: float, end: float, out: Path, d
         if status not in ("IN_QUEUE", "IN_PROGRESS"):
             raise RuntimeError(f"fal job ended as {status}")
         if time.monotonic() > deadline:
-            raise TimeoutError("fal took too long")
+            # Cancel so a clip nobody will use isn't made (and billed) later.
+            try:
+                _fal_json(job.get("cancel_url") or f"{response_url}/cancel", method="PUT", timeout=15)
+            except Exception as exc:
+                print(f"[talking] could not cancel the fal job: {exc}", flush=True)
+            raise TimeoutError(f"fal took too long (still {status})")
         time.sleep(3)
     video_url = _fal_json(response_url)["video"]["url"]
     with urllib.request.urlopen(video_url, timeout=120) as resp:

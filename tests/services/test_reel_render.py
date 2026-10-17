@@ -266,7 +266,7 @@ class TestTalkingScenes:
         face.write_bytes(PNG_1PX)
         sent, statuses = {}, iter(["IN_QUEUE", "IN_PROGRESS", "COMPLETED"])
 
-        def fake_json(url, body=None, timeout=60):
+        def fake_json(url, body=None, timeout=60, method=None):
             if body is not None:
                 sent.update(body)
                 return {"status_url": "https://q/status", "response_url": "https://q/result"}
@@ -305,3 +305,21 @@ class TestTalkingScenes:
         res = TestClient(rr.app).post("/render", json=body, headers={"Authorization": "Bearer secret"})
         assert res.status_code == 200
         assert res.headers["x-talking-scenes"] == "1/1"
+
+    def test_talking_clip_cancels_on_timeout(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setattr(rr, "FAL_KEY", "k")
+        voice = self._tone(tmp_path / "voice.wav", 3)
+        face = tmp_path / "face.jpg"
+        face.write_bytes(PNG_1PX)
+        calls = []
+
+        def fake_json(url, body=None, timeout=60, method=None):
+            calls.append((method or ("POST" if body else "GET"), url))
+            if body is not None:
+                return {"status_url": "https://q/status", "response_url": "https://q/r", "cancel_url": "https://q/r/cancel"}
+            return {"status": "IN_QUEUE"}
+
+        monkeypatch.setattr(rr, "_fal_json", fake_json)
+        with pytest.raises(TimeoutError):
+            rr.talking_clip(face, voice, 0.0, 2.0, tmp_path / "talk-1.mp4", rr.time.monotonic() - 1)
+        assert ("PUT", "https://q/r/cancel") in calls
