@@ -1,5 +1,7 @@
 # Builds the reel render image with Cloud Build. Run from the repo root:
 #   gcloud builds submit --config services/reel_render/cloudbuild.yaml --substitutions=_REGION=asia-southeast1 .
+# With _SERVICE set (e.g. by a GitHub push trigger: _SERVICE=openmontage-render) it also deploys the
+# new image to that Cloud Run service, keeping the service's settings, secrets and environment.
 steps:
   - name: gcr.io/cloud-builders/docker
     args:
@@ -9,10 +11,22 @@ steps:
       - -t
       - ${_REGION}-docker.pkg.dev/$PROJECT_ID/openmontage/reel-render:latest
       - .
+  - name: gcr.io/cloud-builders/docker
+    args: [push, "${_REGION}-docker.pkg.dev/$PROJECT_ID/openmontage/reel-render:latest"]
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        if [ -z "${_SERVICE}" ]; then echo "No _SERVICE set; image built, not deployed."; exit 0; fi
+        gcloud run deploy "${_SERVICE}" --region "${_REGION}" --quiet \
+          --image "${_REGION}-docker.pkg.dev/$PROJECT_ID/openmontage/reel-render:latest"
 images:
   - ${_REGION}-docker.pkg.dev/$PROJECT_ID/openmontage/reel-render:latest
 substitutions:
   _REGION: asia-southeast1
+  _SERVICE: ""
 options:
   machineType: E2_HIGHCPU_8
+  logging: CLOUD_LOGGING_ONLY
 timeout: 1800s
