@@ -451,6 +451,9 @@ class TestCardsAndMotion:
         assert res.status_code == 200
         assert res.headers["x-motion-scenes"] == "1/1"
         assert "x-talking-scenes" not in res.headers
+        # Streamed in chunks: Cloud Run rejects single-piece responses over 32 MB.
+        assert "content-length" not in res.headers
+        assert res.content == b"mp4"
 
 
 class TestClips:
