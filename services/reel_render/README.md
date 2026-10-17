@@ -83,6 +83,11 @@ gcloud run deploy openmontage-render \
 `--min-instances 0` means it costs nothing while idle, but the first render after a quiet
 spell waits for the service to start, usually under 30 seconds.
 
+To deploy automatically on every push to `main`, add a Cloud Build trigger for this repo with
+config file `services/reel_render/cloudbuild.yaml` and the substitution
+`_SERVICE=openmontage-render`. The build then also runs `gcloud run deploy` with the new image, and
+the service keeps its memory, timeout, secrets and environment.
+
 Then turn it on in ViralReel Studio. See that repo's README, section "HD Reel export (OpenMontage)".
 
 ## Talking scenes (optional)
