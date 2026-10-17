@@ -456,6 +456,43 @@ class TestCardsAndMotion:
         assert res.content == b"mp4"
 
 
+class TestEndCardAndSfx:
+    def test_end_card_is_appended_after_last_scene(self, tmp_path: Path):
+        req = _request(endCard={"handle": "@pinoycoach", "text": "Follow for part 2"})
+        props = rr.build_props(req, [tmp_path / "scene-1.png", tmp_path / "scene-2.png"], None, None)
+        end = props["cuts"][-1]
+        assert len(props["cuts"]) == 3
+        assert end["type"] == "reel_card" and end["in_seconds"] == 5.0 and end["out_seconds"] == 7.5
+        assert end["card"] == {"kind": "end", "title": "@pinoycoach", "label": "Follow for part 2"}
+        assert all(c["startMs"] < 5000 for c in props["captions"])  # no captions on the end card
+
+    def test_motion_and_talking_ignore_the_end_card_index(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setattr(rr, "FAL_KEY", "k")
+        req = _request(endCard={"handle": "@me"}, motionScenes=[2])
+        props = rr.build_props(req, [tmp_path / "scene-1.png", tmp_path / "scene-2.png"], None, None)
+        assert rr.add_motion_scenes(props, req, tmp_path, []) == 0
+
+    def test_compare_card_kind(self):
+        req = _request()
+        req.scenes[0].card = rr.Card(kind="compare", items=["Myth: raw", "Fact: boiled"])
+        assert req.scenes[0].card.kind == "compare"
+
+    def test_sfx_events(self, tmp_path: Path):
+        req = _request(endCard={"handle": "@me"})
+        props = rr.build_props(req, [tmp_path / "scene-1.png", tmp_path / "scene-2.png"], None, None)
+        assert rr.sfx_events(props) == [("whoosh", 1.75), ("whoosh", 4.75), ("pop", 5.35)]
+
+    def test_mix_sfx_over_voice_and_over_silence(self, tmp_path: Path):
+        import subprocess
+        voice = tmp_path / "voice.wav"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                        "sine=frequency=300:duration=3", str(voice)], check=True)
+        out = rr.mix_sfx(voice, [("whoosh", 1.0), ("pop", 2.0)], 4.0, tmp_path)
+        assert abs(rr.probe_duration(out) - 4.0) < 0.1
+        out2 = rr.mix_sfx(None, [("pop", 0.5)], 2.0, tmp_path)
+        assert abs(rr.probe_duration(out2) - 2.0) < 0.1
+
+
 class TestClips:
     def test_drive_file_id(self):
         fid = "1AbCdEfGhIjKlMnOpQrStUvWxYz012345"

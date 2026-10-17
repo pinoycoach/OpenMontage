@@ -86,12 +86,22 @@ DATA_URL_RE = re.compile(r"^data:([\w/+.-]+)(?:;[\w=.-]+)*;base64,(.*)$", re.DOT
 
 
 class Card(BaseModel):
-    """Content for an animated card scene (stat / list / quote), drawn by the composer."""
-    kind: Literal["stat", "list", "quote"]
+    """Content for an animated card scene (stat / list / quote / compare), drawn by the composer.
+    Compare items are the two sides as "Label: text", e.g. "Myth: …" and "Fact: …"."""
+    kind: Literal["stat", "list", "quote", "compare"]
     title: Optional[str] = Field(None, max_length=300)
     label: Optional[str] = Field(None, max_length=300)
     items: list[str] = Field(default_factory=list, max_length=5)
     source: Optional[str] = Field(None, max_length=200)
+
+
+class EndCard(BaseModel):
+    """A closing card after the last scene: the creator's handle and a call to action."""
+    handle: str = Field(min_length=1, max_length=40)
+    text: str = Field("Follow for more", max_length=40)
+
+
+END_CARD_SECONDS = 2.5
 
 
 class Scene(BaseModel):
@@ -121,6 +131,10 @@ class RenderRequest(BaseModel):
     motionScenes: list[int] = Field(default_factory=list, max_length=MAX_MOTION_SCENES)
     # Floating particles over the whole video (part of a visual style).
     particles: Optional[Particles] = None
+    # Closing card with the creator's handle, shown after the last scene.
+    endCard: Optional[EndCard] = None
+    # Whoosh on scene changes and a soft pop when a card appears, mixed under the voice.
+    sfx: bool = False
 
 
 app = FastAPI(title="OpenMontage reel render")
@@ -347,6 +361,16 @@ def build_props(req: RenderRequest, image_paths: list[Path], voice_path: Optiona
             "captionBackgroundColor": "rgba(0, 0, 0, 0.7)",
         },
     }
+    if req.endCard and cuts:
+        start = cuts[-1]["out_seconds"]
+        cuts.append({
+            "id": "end-card",
+            "source": cuts[-1]["source"],
+            "in_seconds": start,
+            "out_seconds": round(start + END_CARD_SECONDS, 3),
+            "type": "reel_card",
+            "card": {"kind": "end", "title": req.endCard.handle, "label": req.endCard.text},
+        })
     if req.particles:
         props["particles"] = req.particles
     if voice_path:
@@ -378,6 +402,45 @@ def mix_music(voice_path: Optional[Path], music_path: Path, total: float, job_di
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
     if proc.returncode != 0 or not out.exists():
         raise HTTPException(500, f"Music mix failed: {proc.stderr[-500:]}")
+    return out
+
+
+SFX_SOURCES = {
+    # Short, quiet effects made with ffmpeg, so there are no sound files to license or ship.
+    "whoosh": ("anoisesrc=d=0.5:c=pink:a=0.6,highpass=f=300,lowpass=f=3500,"
+               "afade=t=in:d=0.3:curve=exp,afade=t=out:st=0.3:d=0.2,volume=1.4"),
+    "pop": ("sine=f=660:d=0.12,afade=t=out:st=0.01:d=0.11:curve=exp,volume=2.7"),
+}
+
+
+def sfx_events(props: dict) -> list[tuple[str, float]]:
+    """A whoosh just before each scene change and a pop as each card lands."""
+    events: list[tuple[str, float]] = []
+    for i, cut in enumerate(props["cuts"]):
+        if i > 0:
+            events.append(("whoosh", max(0.0, cut["in_seconds"] - 0.25)))
+        if cut.get("type") == "reel_card":
+            events.append(("pop", cut["in_seconds"] + 0.35))
+    return events
+
+
+def mix_sfx(base: Optional[Path], events: list[tuple[str, float]], total: float, job_dir: Path) -> Path:
+    """Lay the effects over the narration (or soundtrack), or over silence when there's no audio."""
+    out = job_dir / "with-sfx.wav"
+    fmt = "aformat=sample_rates=48000:channel_layouts=stereo"
+    inputs = ["-i", str(base)] if base else ["-f", "lavfi", "-t", f"{total:.2f}", "-i", "anullsrc=r=48000:cl=stereo"]
+    graph = [f"[0:a]{fmt},apad=whole_dur={total:.2f}[base]"]
+    labels = ["[base]"]
+    for n, (kind, at) in enumerate(events):
+        ms = int(at * 1000)
+        graph.append(f"{SFX_SOURCES[kind]},{fmt},adelay={ms}|{ms}[e{n}]")
+        labels.append(f"[e{n}]")
+    graph.append(f"{''.join(labels)}amix=inputs={len(labels)}:duration=first:normalize=0,alimiter=limit=0.95[out]")
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", *inputs, "-filter_complex", ";".join(graph),
+           "-map", "[out]", "-t", f"{total:.2f}", str(out)]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    if proc.returncode != 0 or not out.exists():
+        raise RuntimeError(f"Sound effects mix failed: {proc.stderr[-500:]}")
     return out
 
 
@@ -489,7 +552,7 @@ def add_motion_scenes(props: dict, req: RenderRequest, job_dir: Path, image_path
     cuts = props["cuts"]
     talking = set(req.talkingScenes) if req.talkingImage else set()
     wanted = sorted({i for i in req.motionScenes
-                     if 0 <= i < len(cuts) and not req.scenes[i].card and i not in talking})
+                     if 0 <= i < len(req.scenes) and not req.scenes[i].card and i not in talking})
     if not (wanted and FAL_KEY):
         return 0
     deadline = time.monotonic() + MOTION_TIMEOUT_SECONDS
@@ -517,7 +580,7 @@ def add_talking_scenes(props: dict, req: RenderRequest, job_dir: Path, voice_pat
     """Swap the requested scenes for talking clips; a scene whose clip fails keeps its image.
     Returns how many scenes now talk."""
     cuts = props["cuts"]
-    wanted = sorted({i for i in req.talkingScenes if 0 <= i < len(cuts)})
+    wanted = sorted({i for i in req.talkingScenes if 0 <= i < len(req.scenes)})
     if not (wanted and req.talkingImage and voice_path and FAL_KEY):
         return 0
     raw, ext = decode_data_url(req.talkingImage, "image/")
@@ -625,6 +688,15 @@ def render_reel(req: RenderRequest, background: BackgroundTasks,
             total = max(c["out_seconds"] for c in props["cuts"]) + 1.0
             soundtrack = mix_music(voice_path, music_path, total, job_dir, req.musicVolume)
             props["audio"]["narration"] = {"src": soundtrack.name, "volume": 1}
+        if req.sfx:
+            narration = props["audio"].get("narration")
+            base = job_dir / narration["src"] if narration else None
+            total = max(c["out_seconds"] for c in props["cuts"]) + 1.0
+            try:
+                mixed = mix_sfx(base, sfx_events(props), total, job_dir)
+                props["audio"]["narration"] = {"src": mixed.name, "volume": 1}
+            except Exception as exc:  # effects are a nice-to-have; render without them
+                print(f"[sfx] skipped: {exc}", flush=True)
         if not _render_lock.acquire(timeout=5):
             raise HTTPException(429, "Another reel is rendering. Try again in a minute.")
         try:

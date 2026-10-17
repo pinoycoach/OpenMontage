@@ -2,18 +2,20 @@ import React from "react";
 import { AbsoluteFill, interpolate, spring, useCurrentFrame, useVideoConfig } from "remotion";
 
 // Animated content card for vertical (1080x1920) reels: a stat that counts up, a list whose items
-// slide in one by one, or a quote revealed word by word. Matches ViralReel Studio's still cards
+// slide in one by one, a quote revealed word by word, a two-sided comparison, or an end card. Matches ViralReel Studio's still cards
 // (same colours and layout), so the preview and the HD export look alike.
 
 export interface ReelCardData {
-  kind: "stat" | "list" | "quote";
-  title?: string; // stat: the number ("8.1B"); list: optional heading; quote: the quote
-  label?: string; // stat: what it measures; quote: who said it
-  items?: string[]; // list items
+  kind: "stat" | "list" | "quote" | "compare" | "end";
+  title?: string; // stat: the number ("8.1B"); list/compare: optional heading; quote: the quote; end: "@handle"
+  label?: string; // stat: what it measures; quote: who said it; end: the call to action
+  items?: string[]; // list items; compare: two sides as "Label: text" ("Myth: …", "Fact: …")
   source?: string; // stat source
 }
 
-const ACCENTS = { stat: "#FDE047", list: "#F472B6", quote: "#A78BFA" } as const;
+const ACCENTS = { stat: "#FDE047", list: "#F472B6", quote: "#A78BFA", compare: "#38BDF8", end: "#F472B6" } as const;
+// Compare: the first side reads as the "wrong / before" one, the second as the "right / after" one.
+const SIDE_COLORS = ["#FB7185", "#34D399"] as const;
 const FONT = '"Inter", "Helvetica Neue", Arial, sans-serif';
 const SIDE = 128;
 // Content sits in the upper two thirds; the bottom is left for captions and the platform's buttons.
@@ -165,9 +167,82 @@ const Quote: React.FC<{ card: ReelCardData }> = ({ card }) => {
   );
 };
 
+// "Myth: Balut is raw" -> {label: "Myth", text: "Balut is raw"}; no short label -> label "".
+export const splitSide = (item: string) => {
+  const m = item.match(/^\s*([^:]{1,16}):\s*(.+)$/);
+  return m ? { label: m[1].trim(), text: m[2].trim() } : { label: "", text: item.trim() };
+};
+
+const Compare: React.FC<{ card: ReelCardData }> = ({ card }) => {
+  const frame = useCurrentFrame();
+  const { fps } = useVideoConfig();
+  const sides = (card.items || []).slice(0, 2).map(splitSide);
+  const start = card.title ? Math.round(fps * 0.35) : 0;
+  const second = start + Math.round(fps * 0.9);
+  return (
+    <Column>
+      {card.title && (
+        <div style={{ color: "#F8FAFC", fontWeight: 800, fontSize: sizeFor(card.title, 84, 56, 0.8, 20), lineHeight: 1.15, marginBottom: 60, ...rise(frame, fps, 0) }}>
+          {card.title}
+        </div>
+      )}
+      {sides.map((side, i) => {
+        const t = spring({ frame: frame - (i === 0 ? start : second), fps, config: { damping: 16, stiffness: 120 } });
+        const color = SIDE_COLORS[i];
+        return (
+          <React.Fragment key={i}>
+            {i === 1 && (
+              <div style={{ color: "#94A3B8", fontWeight: 800, fontSize: 44, letterSpacing: 6, margin: "28px 0", opacity: t, textAlign: "center" }}>VS</div>
+            )}
+            <div style={{ borderRadius: 36, padding: "40px 48px", background: `${color}1F`, border: `4px solid ${color}`, opacity: t, transform: `translateX(${interpolate(t, [0, 1], [i === 0 ? -90 : 90, 0])}px)` }}>
+              {side.label && (
+                <div style={{ color, fontWeight: 800, fontSize: 46, letterSpacing: 2, textTransform: "uppercase", marginBottom: 14 }}>
+                  {i === 0 ? "✕ " : "✓ "}{side.label}
+                </div>
+              )}
+              <div style={{ color: "#F8FAFC", fontWeight: 700, fontSize: sizeFor(side.text, 70, 46, 0.6, 22), lineHeight: 1.2 }}>{side.text}</div>
+            </div>
+          </React.Fragment>
+        );
+      })}
+    </Column>
+  );
+};
+
+const End: React.FC<{ card: ReelCardData }> = ({ card }) => {
+  const frame = useCurrentFrame();
+  const { fps } = useVideoConfig();
+  const handle = card.title || "";
+  const pop = spring({ frame: frame - Math.round(fps * 0.45), fps, config: { damping: 9, stiffness: 140 } });
+  // A gentle pulse on the button once it has landed, to draw the eye.
+  const pulse = 1 + 0.04 * Math.max(0, Math.sin(((frame - fps) / fps) * Math.PI * 2)) * (frame > fps ? 1 : 0);
+  return (
+    <Column>
+      <div style={{ textAlign: "center", display: "flex", flexDirection: "column", alignItems: "center" }}>
+        <div style={{ color: "#F8FAFC", fontWeight: 800, fontSize: sizeFor(handle, 120, 64, 2.4, 12), lineHeight: 1.1, ...rise(frame, fps, 0) }}>
+          {handle}
+        </div>
+        <div style={{ marginTop: 70, padding: "34px 80px", borderRadius: 999, background: `linear-gradient(90deg, #A855F7, ${ACCENTS.end})`, color: "#FFFFFF", fontWeight: 800, fontSize: 60, transform: `scale(${pop * pulse})` }}>
+          {card.label || "Follow for more"}
+        </div>
+      </div>
+    </Column>
+  );
+};
+
 export const ReelCard: React.FC<{ card: ReelCardData }> = ({ card }) => (
   <AbsoluteFill>
     <Background accent={ACCENTS[card.kind] || ACCENTS.stat} />
-    {card.kind === "list" ? <List card={card} /> : card.kind === "quote" ? <Quote card={card} /> : <Stat card={card} />}
+    {card.kind === "list" ? (
+      <List card={card} />
+    ) : card.kind === "quote" ? (
+      <Quote card={card} />
+    ) : card.kind === "compare" ? (
+      <Compare card={card} />
+    ) : card.kind === "end" ? (
+      <End card={card} />
+    ) : (
+      <Stat card={card} />
+    )}
   </AbsoluteFill>
 );
