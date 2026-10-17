@@ -85,6 +85,29 @@ spell waits for the service to start, usually under 30 seconds.
 
 Then turn it on in ViralReel Studio. See that repo's README, section "HD Reel export (OpenMontage)".
 
+## Talking scenes (optional)
+
+With a fal key, a request can ask for talking scenes: `talkingImage` (the persona photo as a data
+URL) and `talkingScenes` (0-based scene numbers, at most 3). For each one the service cuts that
+scene's stretch of the narration, sends it with the photo to fal's `fal-ai/flashtalk` model, and
+plays the lip-synced clip instead of the image. Because the audio comes from the narration
+itself, the lips match what the viewer hears. A clip that fails, or isn't ready within
+`TALKING_TIMEOUT_SECONDS` (default 360), falls back to the scene's image; the response header
+`X-Talking-Scenes` says how many were made, e.g. `2/2`. `/health` reports `"talking": true`
+when a key is set.
+
+Store the key once and give the service access:
+
+```bash
+read -s -p "fal key: " K && printf '%s' "$K" | gcloud secrets create fal-api-key --data-file=- && unset K
+gcloud secrets add-iam-policy-binding fal-api-key \
+  --member="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor"
+gcloud run services update openmontage-render --region $REGION --update-secrets FAL_KEY=fal-api-key:latest
+```
+
+fal bills about $0.02 per second of talking clip, charged to the fal account, not Google Cloud.
+
 ## Speed
 
 In testing, a 10-second reel took about 27 seconds on 4 CPUs, plus a few seconds to transcribe

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import concurrent.futures
 import hmac
 import json
 import os
@@ -26,6 +27,8 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
+import urllib.request
 import uuid
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -42,6 +45,11 @@ RENDER_TIMEOUT_SECONDS = int(os.environ.get("RENDER_TIMEOUT_SECONDS", "840"))
 # "whisper" times captions to the real speech; anything else spreads words evenly per scene.
 CAPTION_SYNC = os.environ.get("CAPTION_SYNC", "whisper")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")
+# Talking scenes: the persona photo lip-synced to that scene's stretch of narration (fal).
+FAL_KEY = os.environ.get("FAL_KEY", "")
+FAL_TALKING_MODEL = os.environ.get("FAL_TALKING_MODEL", "fal-ai/flashtalk")
+TALKING_TIMEOUT_SECONDS = int(os.environ.get("TALKING_TIMEOUT_SECONDS", "360"))
+MAX_TALKING_SCENES = 3
 MAX_SCENES = 30
 MAX_ASSET_BYTES = 25 * 1024 * 1024
 FPS = 30
@@ -86,6 +94,9 @@ class RenderRequest(BaseModel):
     captions: bool = True
     music: Optional[str] = None
     musicVolume: float = Field(0.2, ge=0, le=1)
+    # Persona photo and the scenes (0-based) where it talks to camera instead of showing the image.
+    talkingImage: Optional[str] = None
+    talkingScenes: list[int] = Field(default_factory=list, max_length=MAX_TALKING_SCENES)
 
 
 app = FastAPI(title="OpenMontage reel render")
@@ -340,6 +351,79 @@ def mix_music(voice_path: Optional[Path], music_path: Path, total: float, job_di
     return out
 
 
+def _fal_json(url: str, body: Optional[dict] = None, timeout: int = 60) -> dict:
+    data = json.dumps(body).encode() if body is not None else None
+    request = urllib.request.Request(url, data=data, method="POST" if data else "GET", headers={
+        "Authorization": f"Key {FAL_KEY}", "Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _as_data_url(path: Path, mime: str) -> str:
+    return f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode()}"
+
+
+def talking_clip(face: Path, voice: Path, start: float, end: float, out: Path, deadline: float) -> Path:
+    """Lip-sync the persona photo to voice[start:end] with fal and save the clip as `out`.
+    The audio is cut from the narration itself, so the lips match what the viewer hears."""
+    segment = out.with_suffix(".mp3")
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{start:.3f}", "-to", f"{end:.3f}",
+                    "-i", str(voice), "-ac", "1", "-b:a", "64k", str(segment)],
+                   check=True, capture_output=True, timeout=60)
+    job = _fal_json(f"https://queue.fal.run/{FAL_TALKING_MODEL}", {
+        "image_url": _as_data_url(face, "image/jpeg"),
+        "audio_url": _as_data_url(segment, "audio/mpeg"),
+    })
+    status_url, response_url = job["status_url"], job["response_url"]
+    while True:
+        status = _fal_json(status_url).get("status")
+        if status == "COMPLETED":
+            break
+        if status not in ("IN_QUEUE", "IN_PROGRESS"):
+            raise RuntimeError(f"fal job ended as {status}")
+        if time.monotonic() > deadline:
+            raise TimeoutError("fal took too long")
+        time.sleep(3)
+    video_url = _fal_json(response_url)["video"]["url"]
+    with urllib.request.urlopen(video_url, timeout=120) as resp:
+        out.write_bytes(resp.read())
+    return out
+
+
+def add_talking_scenes(props: dict, req: RenderRequest, job_dir: Path, voice_path: Optional[Path]) -> int:
+    """Swap the requested scenes for talking clips; a scene whose clip fails keeps its image.
+    Returns how many scenes now talk."""
+    cuts = props["cuts"]
+    wanted = sorted({i for i in req.talkingScenes if 0 <= i < len(cuts)})
+    if not (wanted and req.talkingImage and voice_path and FAL_KEY):
+        return 0
+    raw, ext = decode_data_url(req.talkingImage, "image/")
+    original = job_dir / f"face-original{ext}"
+    original.write_bytes(raw)
+    face = job_dir / "face.jpg"  # small JPEG keeps the inline upload light
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(original),
+                    "-vf", "scale='min(768,iw)':-2", "-q:v", "3", str(face)],
+                   check=True, capture_output=True, timeout=60)
+    deadline = time.monotonic() + TALKING_TIMEOUT_SECONDS
+    talked = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(wanted)) as pool:
+        futures = {
+            pool.submit(talking_clip, face, voice_path, cuts[i]["in_seconds"], cuts[i]["out_seconds"],
+                        job_dir / f"talk-{i + 1}.mp4", deadline): i
+            for i in wanted
+        }
+        for future in concurrent.futures.as_completed(futures):
+            i = futures[future]
+            try:
+                clip = future.result()
+            except Exception as exc:  # fal down, slow or out of credit: keep the image
+                print(f"[talking] scene {i + 1} kept its image: {exc}", flush=True)
+                continue
+            cuts[i]["source"] = clip.name
+            talked += 1
+    return talked
+
+
 def render(props: dict, job_dir: Path, aspect: str) -> Path:
     width, height = (1080, 1920) if aspect == "9:16" else (1920, 1080)
     props_path = job_dir / "props.json"
@@ -364,7 +448,7 @@ def render(props: dict, job_dir: Path, aspect: str) -> Path:
 @app.get("/health")  # Cloud Run reserves paths ending in "z", so /healthz never reaches the app there
 @app.get("/healthz")
 def healthz() -> dict:
-    return {"ok": True, "composer": (COMPOSER_DIR / "node_modules").exists()}
+    return {"ok": True, "composer": (COMPOSER_DIR / "node_modules").exists(), "talking": bool(FAL_KEY)}
 
 
 @app.post("/render")
@@ -396,6 +480,7 @@ def render_reel(req: RenderRequest, background: BackgroundTasks,
 
         heard = transcribe(voice_path) if voice_path else None
         props = build_props(req, image_paths, voice_path, voice_seconds, heard)
+        talked = add_talking_scenes(props, req, job_dir, voice_path)
         if music_path:
             # Explainer adds a one-second fade after the last scene.
             total = max(c["out_seconds"] for c in props["cuts"]) + 1.0
@@ -410,4 +495,5 @@ def render_reel(req: RenderRequest, background: BackgroundTasks,
     except Exception:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise
-    return FileResponse(out, media_type="video/mp4", filename="reel-hd.mp4")
+    headers = {"X-Talking-Scenes": f"{talked}/{len(set(req.talkingScenes))}"} if req.talkingScenes else None
+    return FileResponse(out, media_type="video/mp4", filename="reel-hd.mp4", headers=headers)
