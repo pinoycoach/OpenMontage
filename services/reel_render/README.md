@@ -108,6 +108,21 @@ gcloud run services update openmontage-render --region $REGION --update-secrets 
 
 fal bills about $0.02 per second of talking clip, charged to the fal account, not Google Cloud.
 
+## Cards, particles and motion scenes (optional)
+
+- **Animated cards.** A scene with `card: {kind: "stat"|"list"|"quote", title, label, items, source}`
+  is drawn as an animated card (the number counts up, list items slide in, quote words appear one by
+  one). The scene's `image` is still required; it is the still version of the card.
+- **Particles.** `particles` (`fireflies`, `petals`, `sparkles`, `mist` or `light-rays`) floats a
+  light particle layer over the whole video, for styles such as an anime look.
+- **Motion scenes.** With the fal key set, `motionScenes` (0-based scene numbers, at most 2) turns
+  those scene images into short video clips with `FAL_MOTION_MODEL` (default
+  `fal-ai/kling-video/v3/standard/image-to-video`, about $0.14 per second of clip, 3–10 s). A
+  scene's optional `motionPrompt` says what should move. Each clip is retimed to the scene's length.
+  Card scenes and talking scenes are skipped. A clip that fails, or isn't ready within
+  `MOTION_TIMEOUT_SECONDS` (default 420), keeps the image. The header `X-Motion-Scenes` says how many
+  were made. Motion and talking clips are made at the same time.
+
 ## Clips (long video → short vertical clips)
 
 For the app's Clips tab. The source is a Google Drive file shared as "Anyone with the link".

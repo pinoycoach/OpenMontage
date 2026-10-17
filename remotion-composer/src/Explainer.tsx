@@ -32,6 +32,8 @@ import type { ScreenshotStep } from "./components/ScreenshotScene";
 import { ProviderChip } from "./components/ProviderChip";
 import { resolveAsset } from "./lib/resolveAsset";
 import type { ParticleType } from "./components/ParticleOverlay";
+import { ParticleOverlay } from "./components/ParticleOverlay";
+import { ReelCard, type ReelCardData } from "./components/ReelCard";
 import { resolveTheme, type ThemeConfig, DEFAULT_THEME } from "./Root";
 
 // Load Space Grotesk font for cinematic typography
@@ -248,6 +250,8 @@ interface Cut {
     scale?: number;
     position?: string | { x: number; y: number };
   };
+  // Vertical reel content card (type: "reel_card")
+  card?: ReelCardData;
   // Anime scene props (type: "anime_scene")
   images?: string[];
   particles?: ParticleType;
@@ -588,6 +592,9 @@ const SceneRenderer: React.FC<{ cut: Cut; theme: ThemeConfig }> = ({ cut, theme 
   const accent = cut.accentColor || theme.accentColor;
 
   // Explicit component types — use theme-derived defaults for colors
+  if (cut.type === "reel_card" && cut.card) {
+    return <ReelCard card={cut.card} />;
+  }
   if (cut.type === "text_card" && cut.text) {
     return maybeWrapWithBg(
       <TextCard text={cut.text} fontSize={cut.fontSize} color={textColor} backgroundColor={bgColor} />
@@ -855,6 +862,11 @@ export const Explainer: React.FC<ExplainerProps> = (props) => {
           </Sequence>
         );
       })}
+
+      {/* Layer 1.5: Optional floating particles over the whole video (e.g. fireflies for an anime look) */}
+      {typeof props.particles === "string" && (
+        <ParticleOverlay type={props.particles as ParticleType} count={18} intensity={0.45} />
+      )}
 
       {/* Layer 2: Overlays (section titles, stat reveals, hero titles) */}
       {overlays?.map((overlay, i) => {

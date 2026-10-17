@@ -21,6 +21,7 @@ import binascii
 import concurrent.futures
 import hmac
 import json
+import math
 import os
 import re
 import shutil
@@ -51,12 +52,17 @@ FAL_KEY = os.environ.get("FAL_KEY", "")
 FAL_TALKING_MODEL = os.environ.get("FAL_TALKING_MODEL", "fal-ai/flashtalk")
 TALKING_TIMEOUT_SECONDS = int(os.environ.get("TALKING_TIMEOUT_SECONDS", "360"))
 MAX_TALKING_SCENES = 3
+# Motion scenes: a still scene image animated into a short video clip (fal, Kling by default).
+FAL_MOTION_MODEL = os.environ.get("FAL_MOTION_MODEL", "fal-ai/kling-video/v3/standard/image-to-video")
+MOTION_TIMEOUT_SECONDS = int(os.environ.get("MOTION_TIMEOUT_SECONDS", "420"))
+MAX_MOTION_SCENES = 2
 MAX_SCENES = 30
 MAX_ASSET_BYTES = 25 * 1024 * 1024
 FPS = 30
 
 CameraMotion = Literal["zoom-in", "zoom-out", "pan-left", "pan-right", "subtle-pulse"]
 CaptionStyle = Literal["yellow-pop", "neon-cyan", "minimal-white"]
+Particles = Literal["fireflies", "petals", "sparkles", "mist", "light-rays"]
 
 # Explainer understands zoom/pan directly; the app's "subtle-pulse" is closest to ken-burns.
 MOTION_MAP = {"subtle-pulse": "ken-burns"}
@@ -79,12 +85,25 @@ MIME_EXT = {
 DATA_URL_RE = re.compile(r"^data:([\w/+.-]+)(?:;[\w=.-]+)*;base64,(.*)$", re.DOTALL)
 
 
+class Card(BaseModel):
+    """Content for an animated card scene (stat / list / quote), drawn by the composer."""
+    kind: Literal["stat", "list", "quote"]
+    title: Optional[str] = Field(None, max_length=300)
+    label: Optional[str] = Field(None, max_length=300)
+    items: list[str] = Field(default_factory=list, max_length=5)
+    source: Optional[str] = Field(None, max_length=200)
+
+
 class Scene(BaseModel):
     image: str
     durationSeconds: float = Field(4, gt=0, le=60)
     captionOverlay: Optional[str] = None
     voiceoverLine: Optional[str] = None
     cameraMotion: Optional[CameraMotion] = None
+    # Set for card scenes: rendered as an animated card; `image` (the still card) is the fallback.
+    card: Optional[Card] = None
+    # What should move in a motion scene, e.g. "steam rises from the cup".
+    motionPrompt: Optional[str] = Field(None, max_length=500)
 
 
 class RenderRequest(BaseModel):
@@ -98,6 +117,10 @@ class RenderRequest(BaseModel):
     # Persona photo and the scenes (0-based) where it talks to camera instead of showing the image.
     talkingImage: Optional[str] = None
     talkingScenes: list[int] = Field(default_factory=list, max_length=MAX_TALKING_SCENES)
+    # Scenes (0-based) whose image is animated into a short video clip.
+    motionScenes: list[int] = Field(default_factory=list, max_length=MAX_MOTION_SCENES)
+    # Floating particles over the whole video (part of a visual style).
+    particles: Optional[Particles] = None
 
 
 app = FastAPI(title="OpenMontage reel render")
@@ -284,13 +307,17 @@ def build_props(req: RenderRequest, image_paths: list[Path], voice_path: Optiona
     word_index = 0
     for i, (scene, path, (start, end)) in enumerate(zip(req.scenes, image_paths, spans)):
         motion = scene.cameraMotion or "subtle-pulse"
-        cuts.append({
+        cut = {
             "id": f"scene-{i + 1}",
             "source": path.name,  # resolved against --public-dir (the job folder)
             "in_seconds": start,
             "out_seconds": end,
             "animation": MOTION_MAP.get(motion, motion),
-        })
+        }
+        if scene.card:
+            cut["type"] = "reel_card"
+            cut["card"] = scene.card.model_dump(exclude_none=True)
+        cuts.append(cut)
         words = lines[i]
         if req.captions and exact:
             for n, word in enumerate(words):
@@ -320,6 +347,8 @@ def build_props(req: RenderRequest, image_paths: list[Path], voice_path: Optiona
             "captionBackgroundColor": "rgba(0, 0, 0, 0.7)",
         },
     }
+    if req.particles:
+        props["particles"] = req.particles
     if voice_path:
         props["audio"]["narration"] = {"src": voice_path.name, "volume": 1}
     props["captionTiming"] = "speech" if exact else "estimated"
@@ -386,6 +415,32 @@ def _fal_file_url(path: Path, mime: str) -> str:
         return _as_data_url(path, mime)
 
 
+def _fal_run(model: str, body: dict, deadline: float, tag: str) -> dict:
+    """Submit a job to fal's queue, wait for it and return its result. Past the deadline the
+    job is cancelled, so a clip nobody will use isn't made (and billed) later."""
+    job = _fal_json(f"https://queue.fal.run/{model}", body)
+    status_url, response_url = job["status_url"], job["response_url"]
+    while True:
+        status = _fal_json(status_url).get("status")
+        if status == "COMPLETED":
+            return _fal_json(response_url)
+        if status not in ("IN_QUEUE", "IN_PROGRESS"):
+            raise RuntimeError(f"fal job ended as {status}")
+        if time.monotonic() > deadline:
+            try:
+                _fal_json(job.get("cancel_url") or f"{response_url}/cancel", method="PUT", timeout=15)
+            except Exception as exc:
+                print(f"[{tag}] could not cancel the fal job: {exc}", flush=True)
+            raise TimeoutError(f"fal took too long (still {status})")
+        time.sleep(3)
+
+
+def _download(url: str, out: Path) -> Path:
+    with urllib.request.urlopen(url, timeout=120) as resp:
+        out.write_bytes(resp.read())
+    return out
+
+
 def talking_clip(face: Path, voice: Path, start: float, end: float, out: Path, deadline: float) -> Path:
     """Lip-sync the persona photo to voice[start:end] with fal and save the clip as `out`.
     The audio is cut from the narration itself, so the lips match what the viewer hears."""
@@ -393,29 +448,69 @@ def talking_clip(face: Path, voice: Path, start: float, end: float, out: Path, d
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{start:.3f}", "-to", f"{end:.3f}",
                     "-i", str(voice), "-ac", "1", "-b:a", "64k", str(segment)],
                    check=True, capture_output=True, timeout=60)
-    job = _fal_json(f"https://queue.fal.run/{FAL_TALKING_MODEL}", {
+    result = _fal_run(FAL_TALKING_MODEL, {
         "image_url": _fal_file_url(face, "image/jpeg"),
         "audio_url": _fal_file_url(segment, "audio/mpeg"),
-    })
-    status_url, response_url = job["status_url"], job["response_url"]
-    while True:
-        status = _fal_json(status_url).get("status")
-        if status == "COMPLETED":
-            break
-        if status not in ("IN_QUEUE", "IN_PROGRESS"):
-            raise RuntimeError(f"fal job ended as {status}")
-        if time.monotonic() > deadline:
-            # Cancel so a clip nobody will use isn't made (and billed) later.
-            try:
-                _fal_json(job.get("cancel_url") or f"{response_url}/cancel", method="PUT", timeout=15)
-            except Exception as exc:
-                print(f"[talking] could not cancel the fal job: {exc}", flush=True)
-            raise TimeoutError(f"fal took too long (still {status})")
-        time.sleep(3)
-    video_url = _fal_json(response_url)["video"]["url"]
-    with urllib.request.urlopen(video_url, timeout=120) as resp:
-        out.write_bytes(resp.read())
+    }, deadline, "talking")
+    return _download(result["video"]["url"], out)
+
+
+MOTION_DEFAULT_PROMPT = ("Subtle, natural motion in the scene; gentle slow camera push-in. "
+                         "Keep the people, objects and composition the same.")
+
+
+def motion_clip(image: Path, prompt: Optional[str], seconds: float, out: Path, deadline: float) -> Path:
+    """Animate a scene image with fal (Kling) and retime the clip to exactly `seconds`."""
+    still = out.with_name(out.stem + "-still.jpg")
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(image),
+                    "-vf", "scale='min(1080,iw)':-2", "-q:v", "3", str(still)],
+                   check=True, capture_output=True, timeout=60)
+    duration = min(10, max(3, math.ceil(seconds)))
+    result = _fal_run(FAL_MOTION_MODEL, {
+        "start_image_url": _fal_file_url(still, "image/jpeg"),
+        "prompt": (prompt or "").strip() or MOTION_DEFAULT_PROMPT,
+        "duration": str(duration),
+        "generate_audio": False,  # the reel has its own narration and music
+        "negative_prompt": "blur, distort, low quality, text, captions, watermark, morphing faces",
+    }, deadline, "motion")
+    raw = _download(result["video"]["url"], out.with_name(out.stem + "-raw.mp4"))
+    # Stretch or squeeze to the scene's length so the clip neither freezes nor gets cut short.
+    factor = seconds / (probe_duration(raw) or duration)
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(raw), "-an",
+                    "-vf", f"setpts={factor:.4f}*PTS", "-t", f"{seconds:.3f}",
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", str(out)],
+                   check=True, capture_output=True, timeout=180)
     return out
+
+
+def add_motion_scenes(props: dict, req: RenderRequest, job_dir: Path, image_paths: list[Path]) -> int:
+    """Swap the requested scenes for animated clips; a scene whose clip fails keeps its image.
+    Card scenes and talking scenes are skipped. Returns how many scenes now move."""
+    cuts = props["cuts"]
+    talking = set(req.talkingScenes) if req.talkingImage else set()
+    wanted = sorted({i for i in req.motionScenes
+                     if 0 <= i < len(cuts) and not req.scenes[i].card and i not in talking})
+    if not (wanted and FAL_KEY):
+        return 0
+    deadline = time.monotonic() + MOTION_TIMEOUT_SECONDS
+    moved = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(wanted)) as pool:
+        futures = {
+            pool.submit(motion_clip, image_paths[i], req.scenes[i].motionPrompt,
+                        cuts[i]["out_seconds"] - cuts[i]["in_seconds"], job_dir / f"motion-{i + 1}.mp4",
+                        deadline): i
+            for i in wanted
+        }
+        for future in concurrent.futures.as_completed(futures):
+            i = futures[future]
+            try:
+                clip = future.result()
+            except Exception as exc:  # fal down, slow or out of credit: keep the image
+                print(f"[motion] scene {i + 1} kept its image: {exc}", flush=True)
+                continue
+            cuts[i]["source"] = clip.name
+            moved += 1
+    return moved
 
 
 def add_talking_scenes(props: dict, req: RenderRequest, job_dir: Path, voice_path: Optional[Path]) -> int:
@@ -476,7 +571,8 @@ def render(props: dict, job_dir: Path, aspect: str) -> Path:
 @app.get("/health")  # Cloud Run reserves paths ending in "z", so /healthz never reaches the app there
 @app.get("/healthz")
 def healthz() -> dict:
-    return {"ok": True, "composer": (COMPOSER_DIR / "node_modules").exists(), "talking": bool(FAL_KEY)}
+    return {"ok": True, "composer": (COMPOSER_DIR / "node_modules").exists(), "talking": bool(FAL_KEY),
+            "motion": bool(FAL_KEY)}
 
 
 @app.post("/render")
@@ -508,7 +604,11 @@ def render_reel(req: RenderRequest, background: BackgroundTasks,
 
         heard = transcribe(voice_path) if voice_path else None
         props = build_props(req, image_paths, voice_path, voice_seconds, heard)
-        talked = add_talking_scenes(props, req, job_dir, voice_path)
+        # Talking and motion clips come from fal at the same time.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            talking_job = pool.submit(add_talking_scenes, props, req, job_dir, voice_path)
+            motion_job = pool.submit(add_motion_scenes, props, req, job_dir, image_paths)
+            talked, moved = talking_job.result(), motion_job.result()
         if music_path:
             # Explainer adds a one-second fade after the last scene.
             total = max(c["out_seconds"] for c in props["cuts"]) + 1.0
@@ -523,8 +623,12 @@ def render_reel(req: RenderRequest, background: BackgroundTasks,
     except Exception:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise
-    headers = {"X-Talking-Scenes": f"{talked}/{len(set(req.talkingScenes))}"} if req.talkingScenes else None
-    return FileResponse(out, media_type="video/mp4", filename="reel-hd.mp4", headers=headers)
+    headers = {}
+    if req.talkingScenes:
+        headers["X-Talking-Scenes"] = f"{talked}/{len(set(req.talkingScenes))}"
+    if req.motionScenes:
+        headers["X-Motion-Scenes"] = f"{moved}/{len(set(req.motionScenes))}"
+    return FileResponse(out, media_type="video/mp4", filename="reel-hd.mp4", headers=headers or None)
 
 
 # ---------------------------------------------------------------------------
