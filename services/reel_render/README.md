@@ -113,6 +113,13 @@ fal bills about $0.02 per second of talking clip, charged to the fal account, no
 - **Animated cards.** A scene with `card: {kind: "stat"|"list"|"quote", title, label, items, source}`
   is drawn as an animated card (the number counts up, list items slide in, quote words appear one by
   one). The scene's `image` is still required; it is the still version of the card.
+- **Comparison cards.** `card.kind: "compare"` with two `items` written as `"Label: text"` (e.g.
+  `"Myth: …"`, `"Fact: …"`) shows the two sides one after the other, red then green, with an
+  optional heading in `title`.
+- **End card.** `endCard: {handle, text}` adds a 2.5 s closing card after the last scene with the
+  handle and a call-to-action button (`text` defaults to "Follow for more").
+- **Sound effects.** `sfx: true` adds a soft whoosh before each scene change and a pop when a card
+  appears, mixed under the voice. The effects are made with ffmpeg, so there are no sound files.
 - **Particles.** `particles` (`fireflies`, `petals`, `sparkles`, `mist` or `light-rays`) floats a
   light particle layer over the whole video, for styles such as an anime look.
 - **Motion scenes.** With the fal key set, `motionScenes` (0-based scene numbers, at most 2) turns
