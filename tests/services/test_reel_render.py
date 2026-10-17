@@ -281,10 +281,10 @@ class TestTalkingScenes:
 
         monkeypatch.setattr(rr, "_fal_json", fake_json)
         monkeypatch.setattr(rr.urllib.request, "urlopen", lambda url, timeout=0: FakeResp())
+        monkeypatch.setattr(rr, "_fal_file_url", lambda path, mime: f"https://cdn/{path.name}")
         out = rr.talking_clip(face, voice, 1.0, 3.0, tmp_path / "talk-1.mp4", rr.time.monotonic() + 60)
         assert out.read_bytes() == b"clip-bytes"
-        assert sent["image_url"].startswith("data:image/jpeg;base64,")
-        assert sent["audio_url"].startswith("data:audio/mpeg;base64,")
+        assert sent == {"image_url": "https://cdn/face.jpg", "audio_url": "https://cdn/talk-1.mp3"}
         assert abs(rr.probe_duration(tmp_path / "talk-1.mp3") - 2.0) < 0.1  # just the scene's stretch
 
     def test_endpoint_reports_talking_header(self, monkeypatch, tmp_path: Path):
@@ -320,6 +320,43 @@ class TestTalkingScenes:
             return {"status": "IN_QUEUE"}
 
         monkeypatch.setattr(rr, "_fal_json", fake_json)
+        monkeypatch.setattr(rr, "_fal_file_url", lambda path, mime: f"https://cdn/{path.name}")
         with pytest.raises(TimeoutError):
             rr.talking_clip(face, voice, 0.0, 2.0, tmp_path / "talk-1.mp4", rr.time.monotonic() - 1)
         assert ("PUT", "https://q/r/cancel") in calls
+
+    def test_fal_file_url_uploads_then_falls_back(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setattr(rr, "FAL_KEY", "k")
+        f = tmp_path / "face.jpg"
+        f.write_bytes(b"jpeg-bytes")
+        puts = []
+
+        class FakeResp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        def fake_urlopen(request, timeout=0):
+            puts.append((request.get_method(), request.full_url, request.data))
+            return FakeResp()
+
+        monkeypatch.setattr(rr, "_fal_json", lambda url, body=None, timeout=60, method=None:
+                            {"upload_url": "https://up/signed", "file_url": "https://cdn/face.jpg"})
+        monkeypatch.setattr(rr.urllib.request, "urlopen", fake_urlopen)
+        assert rr._fal_file_url(f, "image/jpeg") == "https://cdn/face.jpg"
+        assert puts == [("PUT", "https://up/signed", b"jpeg-bytes")]
+
+        def broken(*a, **k):
+            raise RuntimeError("fal HTTP 401: no")
+        monkeypatch.setattr(rr, "_fal_json", broken)
+        assert rr._fal_file_url(f, "image/jpeg").startswith("data:image/jpeg;base64,")
+
+    def test_fal_json_reports_fal_error_detail(self, monkeypatch):
+        import io
+
+        def fake_urlopen(request, timeout=0):
+            raise rr.urllib.error.HTTPError(request.full_url, 422, "Unprocessable", {},
+                                            io.BytesIO(b'{"detail":[{"loc":["body","image_url"]}]}'))
+
+        monkeypatch.setattr(rr.urllib.request, "urlopen", fake_urlopen)
+        with pytest.raises(RuntimeError, match=r"fal HTTP 422: .*image_url"):
+            rr._fal_json("https://queue.fal.run/x", {"a": 1})

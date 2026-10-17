@@ -28,6 +28,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 import uuid
 from difflib import SequenceMatcher
@@ -356,12 +357,33 @@ def _fal_json(url: str, body: Optional[dict] = None, timeout: int = 60, method: 
     method = method or ("POST" if data else "GET")
     request = urllib.request.Request(url, data=data, method=method, headers={
         "Authorization": f"Key {FAL_KEY}", "Content-Type": "application/json"})
-    with urllib.request.urlopen(request, timeout=timeout) as resp:
-        return json.loads(resp.read().decode())
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        # Keep fal's explanation (e.g. which input a 422 rejected) for the logs.
+        detail = exc.read().decode(errors="replace")[:500]
+        raise RuntimeError(f"fal HTTP {exc.code}: {detail}") from exc
 
 
 def _as_data_url(path: Path, mime: str) -> str:
     return f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode()}"
+
+
+def _fal_file_url(path: Path, mime: str) -> str:
+    """Upload a file to fal's CDN and return its URL. Some models (sync-3) reject inline data
+    URLs; if the upload itself fails, fall back to the data URL, which others accept."""
+    try:
+        upload = _fal_json("https://rest.fal.ai/storage/upload/initiate?storage_type=fal-cdn-v3",
+                           {"file_name": path.name, "content_type": mime}, timeout=30)
+        request = urllib.request.Request(upload["upload_url"], data=path.read_bytes(), method="PUT",
+                                         headers={"Content-Type": mime})
+        with urllib.request.urlopen(request, timeout=60):
+            pass
+        return upload["file_url"]
+    except Exception as exc:
+        print(f"[talking] upload to fal failed, sending {path.name} inline: {exc}", flush=True)
+        return _as_data_url(path, mime)
 
 
 def talking_clip(face: Path, voice: Path, start: float, end: float, out: Path, deadline: float) -> Path:
@@ -372,8 +394,8 @@ def talking_clip(face: Path, voice: Path, start: float, end: float, out: Path, d
                     "-i", str(voice), "-ac", "1", "-b:a", "64k", str(segment)],
                    check=True, capture_output=True, timeout=60)
     job = _fal_json(f"https://queue.fal.run/{FAL_TALKING_MODEL}", {
-        "image_url": _as_data_url(face, "image/jpeg"),
-        "audio_url": _as_data_url(segment, "audio/mpeg"),
+        "image_url": _fal_file_url(face, "image/jpeg"),
+        "audio_url": _fal_file_url(segment, "audio/mpeg"),
     })
     status_url, response_url = job["status_url"], job["response_url"]
     while True:
