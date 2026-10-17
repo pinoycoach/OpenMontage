@@ -362,6 +362,97 @@ class TestTalkingScenes:
             rr._fal_json("https://queue.fal.run/x", {"a": 1})
 
 
+class TestCardsAndMotion:
+    def _tone(self, path: Path, seconds: float) -> Path:
+        import subprocess
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                        f"sine=frequency=300:duration={seconds}", str(path)], check=True)
+        return path
+
+    def test_card_scene_and_particles_in_props(self, tmp_path: Path):
+        req = _request(particles="fireflies")
+        req.scenes[1].card = rr.Card(kind="stat", title="8.1B", label="people on Earth")
+        props = rr.build_props(req, [tmp_path / "scene-1.png", tmp_path / "scene-2.png"], None, None)
+        assert "type" not in props["cuts"][0]
+        assert props["cuts"][1]["type"] == "reel_card"
+        assert props["cuts"][1]["card"] == {"kind": "stat", "title": "8.1B", "label": "people on Earth", "items": []}
+        assert props["cuts"][1]["source"] == "scene-2.png"  # still card stays as the fallback
+        assert props["particles"] == "fireflies"
+        assert "particles" not in rr.build_props(_request(), [tmp_path / "a.png", tmp_path / "b.png"], None, None)
+
+    def test_rejects_unknown_particles(self):
+        with pytest.raises(ValueError):
+            _request(particles="confetti")
+
+    def test_motion_skips_cards_and_talking_and_keeps_image_on_failure(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setattr(rr, "FAL_KEY", "k")
+        scenes = [{"image": PNG_URL, "durationSeconds": 2, "voiceoverLine": f"line {i}"} for i in range(4)]
+        scenes[2]["card"] = {"kind": "quote", "title": "Hi"}
+        req = rr.RenderRequest(scenes=scenes, motionScenes=[0, 1], talkingImage=PNG_URL, talkingScenes=[0])
+        paths = [tmp_path / f"scene-{i + 1}.png" for i in range(4)]
+        props = rr.build_props(req, paths, None, None)
+        calls = []
+
+        def fake_clip(image, prompt, seconds, out, deadline):
+            calls.append((image.name, seconds))
+            out.write_bytes(b"mp4")
+            return out
+
+        monkeypatch.setattr(rr, "motion_clip", fake_clip)
+        assert rr.add_motion_scenes(props, req, tmp_path, paths) == 1
+        assert calls == [("scene-2.png", 2.0)]  # scene 1 talks
+        assert props["cuts"][1]["source"] == "motion-2.mp4"
+
+        req2 = rr.RenderRequest(scenes=scenes, motionScenes=[2, 3])
+        monkeypatch.setattr(rr, "motion_clip", lambda *a: (_ for _ in ()).throw(TimeoutError("slow")))
+        props2 = rr.build_props(req2, paths, None, None)
+        assert rr.add_motion_scenes(props2, req2, tmp_path, paths) == 0
+        assert props2["cuts"][3]["source"] == "scene-4.png"
+        monkeypatch.setattr(rr, "FAL_KEY", "")
+        assert rr.add_motion_scenes(props2, req2, tmp_path, paths) == 0
+
+    def test_motion_clip_sends_kling_input_and_retimes(self, tmp_path: Path, monkeypatch):
+        import subprocess
+        monkeypatch.setattr(rr, "FAL_KEY", "k")
+        image = tmp_path / "scene-1.png"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=red:s=320x568",
+                        "-frames:v", "1", str(image)], check=True)
+        clip = tmp_path / "kling.mp4"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=blue:s=320x568:d=5",
+                        "-pix_fmt", "yuv420p", str(clip)], check=True)
+        sent = {}
+
+        def fake_run(model, body, deadline, tag):
+            sent.update(body, model=model)
+            return {"video": {"url": "https://cdn/kling.mp4"}}
+
+        monkeypatch.setattr(rr, "_fal_run", fake_run)
+        monkeypatch.setattr(rr, "_fal_file_url", lambda path, mime: f"https://cdn/{path.name}")
+        monkeypatch.setattr(rr, "_download", lambda url, out: out.write_bytes(clip.read_bytes()) and out)
+        out = rr.motion_clip(image, None, 3.4, tmp_path / "motion-1.mp4", rr.time.monotonic() + 60)
+        assert sent["model"] == rr.FAL_MOTION_MODEL
+        assert sent["duration"] == "4" and sent["generate_audio"] is False
+        assert sent["start_image_url"] == "https://cdn/motion-1-still.jpg"
+        assert sent["prompt"] == rr.MOTION_DEFAULT_PROMPT
+        assert abs(rr.probe_duration(out) - 3.4) < 0.15
+
+    def test_endpoint_reports_motion_header(self, monkeypatch):
+        monkeypatch.setattr(rr, "RENDER_TOKEN", "secret")
+        monkeypatch.setattr(rr, "add_motion_scenes", lambda props, req, job_dir, paths: 1)
+
+        def fake_render(props, job_dir, aspect):
+            out = job_dir / "reel.mp4"
+            out.write_bytes(b"mp4")
+            return out
+
+        monkeypatch.setattr(rr, "render", fake_render)
+        body = {"scenes": [{"image": PNG_URL, "durationSeconds": 2}], "motionScenes": [0]}
+        res = TestClient(rr.app).post("/render", json=body, headers={"Authorization": "Bearer secret"})
+        assert res.status_code == 200
+        assert res.headers["x-motion-scenes"] == "1/1"
+        assert "x-talking-scenes" not in res.headers
+
+
 class TestClips:
     def test_drive_file_id(self):
         fid = "1AbCdEfGhIjKlMnOpQrStUvWxYz012345"
