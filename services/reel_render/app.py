@@ -1274,7 +1274,10 @@ def dub_render(req: DubRenderRequest, background: BackgroundTasks,
         steps = []
         if req.coverSubtitles:
             band = f"crop=iw:trunc(ih*{bottom - top:.4f}/2)*2:0:trunc(ih*{top:.4f}/2)*2"
-            steps.append(f"[0:v]split[base][cut];[cut]{band},boxblur=24:3[blur];"
+            # The blur radius may not exceed half the strip's height (chroma planes are half as tall), so a
+            # tight band around one subtitle line gets a smaller radius.
+            blur = "boxblur=luma_radius='min(24,h/2-1)':luma_power=3:chroma_radius='min(24,ch/2-1)':chroma_power=3"
+            steps.append(f"[0:v]split[base][cut];[cut]{band},{blur}[blur];"
                          f"[base][blur]overlay=0:trunc(H*{top:.4f}/2)*2,"
                          f"drawbox=x=0:y=ih*{top:.4f}:w=iw:h=ih*{bottom - top:.4f}:color=black@0.35:t=fill[v1]")
         else:
