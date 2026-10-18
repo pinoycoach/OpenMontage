@@ -629,3 +629,19 @@ class TestDub:
         data = res.json()
         assert data["segments"][0]["text"] == "你好" and data["width"] == 320 and data["height"] == 568
         assert seen == {"language": "zh", "model": rr.DUB_WHISPER_MODEL}
+        assert data["frames"] and data["frames"][0].startswith("data:image/jpeg;base64,")
+        assert "pitch" in data["segments"][0]
+
+    def test_segment_pitch_tells_low_from_high_voices(self, tmp_path: Path):
+        import subprocess
+        audio = tmp_path / "a.wav"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error",
+                        "-f", "lavfi", "-i", "aevalsrc='0.4*sin(2*PI*120*t)+0.2*sin(2*PI*240*t)':d=2:s=16000",
+                        "-f", "lavfi", "-i", "aevalsrc='0.4*sin(2*PI*220*t)+0.2*sin(2*PI*440*t)':d=2:s=16000",
+                        "-filter_complex", "[0][1]concat=n=2:v=0:a=1,aformat=sample_fmts=s16:channel_layouts=mono",
+                        str(audio)], check=True)
+        segs = [{"start": 0.1, "end": 1.9}, {"start": 2.1, "end": 3.9}, {"start": 0.0, "end": 0.05}]
+        rr.segment_pitch(audio, segs)
+        assert 110 <= segs[0]["pitch"] <= 130
+        assert 205 <= segs[1]["pitch"] <= 235
+        assert segs[2]["pitch"] is None

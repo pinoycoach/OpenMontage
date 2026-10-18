@@ -152,7 +152,10 @@ Downloaded videos live in memory on Cloud Run, so give the service 8 GiB for lon
 
 `POST /dub/transcribe {driveUrl, language}` returns the episode's lines in its own language
 (`language` defaults to `zh`; transcribed with `DUB_WHISPER_MODEL`, default `small`), plus the frame
-size. The app translates the lines and makes the new voices.
+size. Each line also carries a rough voice `pitch` in Hz (men about 85-160, women about 165-260; a
+hint for telling speakers apart), and `frames` holds a few small JPEG stills taken while people
+speak, so the app can find where the burned-in subtitles sit. The app translates the lines and makes
+the new voices.
 
 `POST /dub/render {driveUrl, lines: [{start, end, audio, text}], keepBackground, coverSubtitles,
 coverTop, coverBottom, subtitles}` lays each new voice line (an audio data URL) where the original
