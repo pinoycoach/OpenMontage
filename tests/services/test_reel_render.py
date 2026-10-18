@@ -603,6 +603,32 @@ class TestDub:
         out.write_bytes(res.content)
         assert abs(rr.probe_duration(out) - 3.0) < 0.2
 
+    @pytest.mark.parametrize("intro_audio", [True, False])
+    def test_prepend_intro_fits_and_joins(self, tmp_path: Path, intro_audio: bool):
+        import subprocess
+        intro = tmp_path / "intro.mp4"
+        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=red:s=640x360:d=2:r=25"]
+        if intro_audio:
+            cmd += ["-f", "lavfi", "-i", "sine=duration=2", "-c:a", "aac", "-shortest"]
+        subprocess.run(cmd + ["-c:v", "libx264", "-pix_fmt", "yuv420p", str(intro)], check=True)
+        main = tmp_path / "main.mp4"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=blue:s=360x640:d=3",
+                        "-f", "lavfi", "-i", "sine=frequency=300:duration=3", "-c:v", "libx264", "-pix_fmt",
+                        "yuv420p", "-c:a", "aac", "-shortest", str(main)], check=True)
+        out = rr.prepend_intro(intro, main, 360, 640, tmp_path / "out.mp4")
+        assert abs(rr.probe_duration(out) - 5.0) < 0.3
+        assert rr.probe_size(out) == (360, 640)
+        assert rr._has_audio(out)
+
+    def test_render_rejects_long_intro(self, monkeypatch, tmp_path: Path):
+        monkeypatch.setattr(rr, "RENDER_TOKEN", "secret")
+        monkeypatch.setattr(rr, "source_video", lambda url: tmp_path / ("intro" if "intro" in url else "src"))
+        monkeypatch.setattr(rr, "probe_duration", lambda p: 30.0 if p.name == "intro" else 3.0)
+        body = {"driveUrl": "src", "introUrl": "intro",
+                "lines": [{"start": 0, "end": 1, "audio": "data:audio/mpeg;base64,AAAA"}]}
+        res = TestClient(rr.app).post("/dub/render", json=body, headers={"Authorization": "Bearer secret"})
+        assert res.status_code == 400 and "intro" in res.json()["detail"]
+
     def test_render_rejects_bad_cover(self, monkeypatch, tmp_path: Path):
         monkeypatch.setattr(rr, "RENDER_TOKEN", "secret")
         monkeypatch.setattr(rr, "source_video", lambda url: tmp_path / "missing.mp4")

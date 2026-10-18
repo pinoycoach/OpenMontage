@@ -971,6 +971,37 @@ class DubRenderRequest(BaseModel):
     coverTop: float = Field(0.78, ge=0, le=1)
     coverBottom: float = Field(0.94, ge=0, le=1)
     subtitles: bool = True
+    # Optional Drive link to a short clip of the creator (e.g. "Idub natin sa Filipino!") played first.
+    introUrl: Optional[str] = Field(None, max_length=500)
+
+
+MAX_INTRO_SECONDS = 15
+
+
+def _has_audio(path: Path) -> bool:
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index",
+                          "-of", "csv=p=0", str(path)], capture_output=True, text=True, timeout=30).stdout
+    return bool(out.strip())
+
+
+def prepend_intro(intro: Path, main: Path, width: int, height: int, out: Path) -> Path:
+    """The intro clip, fitted to the episode's frame (letterboxed if its shape differs), then the episode."""
+    duration = probe_duration(intro)
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(intro), "-i", str(main)]
+    intro_audio = "[0:a]"
+    if not _has_audio(intro):
+        cmd += ["-f", "lavfi", "-t", f"{duration:.3f}", "-i", f"anullsrc=r={VOICE_RATE}:cl=stereo"]
+        intro_audio = "[2:a]"
+    norm_a = f"aresample={VOICE_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo"
+    graph = (f"[0:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
+             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[iv];"
+             f"[1:v]setsar=1,fps=30,format=yuv420p[mv];"
+             f"{intro_audio}{norm_a}[ia];[1:a]{norm_a}[ma];"
+             f"[iv][ia][mv][ma]concat=n=2:v=1:a=1[v][a]")
+    cmd += ["-filter_complex", graph, "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "veryfast",
+            "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(out)]
+    subprocess.run(cmd, check=True, capture_output=True, timeout=900)
+    return out
 
 
 def segment_pitch(audio: Path, segments: list[dict]) -> None:
@@ -1229,6 +1260,14 @@ def dub_render(req: DubRenderRequest, background: BackgroundTasks,
         raise HTTPException(400, "That file isn't a video we can read.")
     if req.coverBottom <= req.coverTop:
         raise HTTPException(400, "The subtitle cover's bottom edge must be below its top edge.")
+    intro: Optional[Path] = None
+    if req.introUrl and req.introUrl.strip():
+        intro = source_video(req.introUrl.strip())
+        intro_seconds = probe_duration(intro)
+        if not intro_seconds:
+            raise HTTPException(400, "The intro clip isn't a video we can read.")
+        if intro_seconds > MAX_INTRO_SECONDS:
+            raise HTTPException(400, f"Keep the intro clip under {MAX_INTRO_SECONDS} seconds.")
     job_dir = Path(tempfile.mkdtemp(prefix=f"dub-{uuid.uuid4().hex[:8]}-"))
     background.add_task(shutil.rmtree, job_dir, ignore_errors=True)
     if not _render_lock.acquire(timeout=5):
@@ -1296,6 +1335,8 @@ def dub_render(req: DubRenderRequest, background: BackgroundTasks,
                         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
                         "-c:a", "aac", "-b:a", "192k", "-shortest", str(out)],
                        check=True, capture_output=True, timeout=900, cwd=job_dir)
+        if intro:
+            out = prepend_intro(intro, out, width, height, job_dir / "with-intro.mp4")
     except subprocess.CalledProcessError as exc:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(500, f"Dubbing failed: {(exc.stderr or b'')[-400:]!r}") from exc
