@@ -1020,6 +1020,83 @@ def segment_frames(src: Path, segments: list[dict], count: int = 3) -> list[str]
     return frames
 
 
+def _gray_still(src: Path, at: float, height: int = 640):
+    import numpy as np
+    proc = subprocess.run(["ffmpeg", "-loglevel", "error", "-ss", f"{at:.2f}", "-i", str(src), "-frames:v", "1",
+                           "-vf", f"scale=-2:{height}", "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+                          capture_output=True, timeout=60)
+    if proc.returncode or len(proc.stdout) < height:
+        return None
+    return np.frombuffer(proc.stdout, np.uint8).reshape(height, -1)
+
+
+def subtitle_text_rows(gray) -> "np.ndarray":
+    """Per image row, the share of pixels that look like burned-in subtitle text: bright pixels with a dark
+    outline a few pixels to the left or right."""
+    import numpy as np
+    bright, dark = gray > 215, gray < 60
+    near = np.zeros_like(dark)
+    for d in (2, 3, 4):
+        near |= np.roll(dark, d, 1) | np.roll(dark, -d, 1)
+    return (bright & near).mean(1)
+
+
+def find_subtitle_band(stills: list) -> Optional[dict]:
+    """Where burned-in subtitles sit, as fractions of the height, from stills taken while people speak.
+    Subtitle rows score high in most stills at the same height; the scene behind them changes."""
+    import numpy as np
+    stills = [s for s in stills if s is not None]
+    if len(stills) < 2:
+        return None
+    rows = np.percentile([subtitle_text_rows(s) for s in stills], 40, axis=0)
+    height = len(rows)
+    lo = int(height * 0.3)  # dialogue subtitles sit in the lower part of the frame
+    floor = float(np.median(rows[lo:]))
+    hits = np.where(rows[lo:] > max(0.03, floor * 4))[0] + lo
+    if not len(hits):
+        return None
+    # Group hit rows that are close together (two-line subtitles) and keep the strongest group.
+    groups, start = [], hits[0]
+    for a, b in zip(hits, hits[1:]):
+        if b - a > height * 0.03:
+            groups.append((start, a))
+            start = b
+    groups.append((start, hits[-1]))
+    top, bottom = max(groups, key=lambda g: rows[g[0]: g[1] + 1].sum())
+    if bottom - top < height * 0.012 or bottom - top > height * 0.2:
+        return None
+    pad = height * 0.02
+    return {"top": round(float(max(0.0, (top - pad) / height)), 3),
+            "bottom": round(float(min(1.0, (bottom + pad) / height)), 3)}
+
+
+def segment_subtitle_band(src: Path, segments: list[dict], count: int = 5) -> Optional[dict]:
+    if not segments:
+        return None
+    indexes = sorted({int(i * (len(segments) - 1) / max(1, count - 1)) for i in range(count)})
+    return find_subtitle_band([_gray_still(src, (segments[i]["start"] + segments[i]["end"]) / 2) for i in indexes])
+
+
+def segment_subtitle_crops(src: Path, segments: list[dict], band: dict) -> None:
+    """Add to each segment a small JPEG of the burned-in subtitle band at its midpoint, so the translator
+    can read what the subtitle says when the speech recognition mishears a word."""
+    top, bottom = band["top"], band["bottom"]
+
+    def crop(seg: dict) -> Optional[str]:
+        at = (seg["start"] + seg["end"]) / 2
+        vf = f"crop=iw:ih*{bottom - top:.4f}:0:ih*{top:.4f},scale=480:-2"
+        proc = subprocess.run(["ffmpeg", "-loglevel", "error", "-ss", f"{at:.2f}", "-i", str(src), "-frames:v", "1",
+                               "-vf", vf, "-q:v", "6", "-f", "image2", "-c:v", "mjpeg", "-"],
+                              capture_output=True, timeout=60)
+        if proc.returncode or not proc.stdout:
+            return None
+        return "data:image/jpeg;base64," + base64.b64encode(proc.stdout).decode()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        for seg, image in zip(segments, pool.map(crop, segments)):
+            seg["subtitleImage"] = image
+
+
 @app.post("/dub/transcribe")
 def dub_transcribe(req: DubTranscribeRequest, authorization: Optional[str] = Header(None)) -> dict:
     _check_token(authorization)
@@ -1039,8 +1116,18 @@ def dub_transcribe(req: DubTranscribeRequest, authorization: Optional[str] = Hea
         except Exception as exc:  # a hint only; never fail the transcript over it
             print(f"[dub] pitch estimate skipped: {exc}", flush=True)
     width, height = probe_size(src)
+    try:
+        band = segment_subtitle_band(src, segments)
+    except Exception as exc:  # a hint only
+        print(f"[dub] subtitle search skipped: {exc}", flush=True)
+        band = None
+    if band:
+        try:
+            segment_subtitle_crops(src, segments, band)
+        except Exception as exc:  # a hint only
+            print(f"[dub] subtitle crops skipped: {exc}", flush=True)
     return {"duration": round(duration, 2), "width": width, "height": height, "segments": segments,
-            "frames": segment_frames(src, segments)}
+            "frames": segment_frames(src, segments), "subtitleBand": band}
 
 
 def background_track(audio: Path, job_dir: Path) -> Path:
