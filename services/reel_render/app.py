@@ -772,14 +772,23 @@ def source_video(drive_url: str) -> Path:
         return path
 
 
-def transcribe_segments(path: Path) -> list[dict]:
+_extra_whisper_models: dict[str, object] = {}
+
+
+def transcribe_segments(path: Path, language: Optional[str] = None, model_name: Optional[str] = None) -> list[dict]:
     """Sentence-ish segments with start/end times for a long recording."""
     from faster_whisper import WhisperModel
     global _whisper_model
     with _whisper_lock:
-        if _whisper_model is None:
-            _whisper_model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
-        segments, _ = _whisper_model.transcribe(str(path), beam_size=1, vad_filter=True)
+        if model_name and model_name != WHISPER_MODEL:
+            if model_name not in _extra_whisper_models:
+                _extra_whisper_models[model_name] = WhisperModel(model_name, device="cpu", compute_type="int8")
+            model = _extra_whisper_models[model_name]
+        else:
+            if _whisper_model is None:
+                _whisper_model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+            model = _whisper_model
+        segments, _ = model.transcribe(str(path), beam_size=1, vad_filter=True, language=language)
         return [{"start": round(s.start, 2), "end": round(s.end, 2), "text": s.text.strip()}
                 for s in segments if s.text.strip()]
 
@@ -923,3 +932,234 @@ def clips_render(req: ClipRenderRequest, background: BackgroundTasks,
         shutil.rmtree(job_dir, ignore_errors=True)
         raise
     return video_response(out, "clip.mp4")
+
+
+# ---------------------------------------------------------------------------
+# Dub: a video on Google Drive -> transcript in its own language (the app translates it and makes
+# the new voices) -> the new voices laid over the original music and effects, with the old burned-in
+# subtitles covered and new ones added.
+# ---------------------------------------------------------------------------
+
+# "small" hears Chinese far better than "base"; it is downloaded into the image at build time.
+DUB_WHISPER_MODEL = os.environ.get("DUB_WHISPER_MODEL", "small")
+FAL_STEMS_MODEL = os.environ.get("FAL_STEMS_MODEL", "fal-ai/demucs")
+STEMS_TIMEOUT_SECONDS = int(os.environ.get("STEMS_TIMEOUT_SECONDS", "300"))
+MAX_DUB_LINES = 400
+MAX_DUB_SECONDS = 15 * 60
+MAX_SPEEDUP = 1.35  # a line may be sped up this much to fit before the next one starts
+VOICE_RATE = 48000
+
+
+class DubTranscribeRequest(BaseModel):
+    driveUrl: str
+    language: str = Field("zh", max_length=8)
+
+
+class DubLine(BaseModel):
+    start: float = Field(ge=0)
+    end: float = Field(gt=0)
+    audio: str  # the new voice for this line, as an audio data URL
+    text: Optional[str] = Field(None, max_length=500)  # subtitle text
+
+
+class DubRenderRequest(BaseModel):
+    driveUrl: str
+    lines: list[DubLine] = Field(min_length=1, max_length=MAX_DUB_LINES)
+    keepBackground: bool = True
+    coverSubtitles: bool = True
+    # Where the original burned-in subtitles sit, as fractions of the frame height.
+    coverTop: float = Field(0.78, ge=0, le=1)
+    coverBottom: float = Field(0.94, ge=0, le=1)
+    subtitles: bool = True
+
+
+@app.post("/dub/transcribe")
+def dub_transcribe(req: DubTranscribeRequest, authorization: Optional[str] = Header(None)) -> dict:
+    _check_token(authorization)
+    src = source_video(req.driveUrl)
+    duration = probe_duration(src)
+    if not duration:
+        raise HTTPException(400, "That file isn't a video we can read.")
+    if duration > MAX_DUB_SECONDS:
+        raise HTTPException(400, f"Dub one episode at a time (up to {MAX_DUB_SECONDS // 60} minutes).")
+    with tempfile.TemporaryDirectory(prefix="dubsrc-") as tmp:
+        audio = Path(tmp) / "audio.wav"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(src), "-vn", "-ac", "1", "-ar", "16000",
+                        str(audio)], check=True, capture_output=True, timeout=600)
+        segments = transcribe_segments(audio, language=req.language or None, model_name=DUB_WHISPER_MODEL)
+    width, height = probe_size(src)
+    return {"duration": round(duration, 2), "width": width, "height": height, "segments": segments}
+
+
+def background_track(audio: Path, job_dir: Path) -> Path:
+    """Music and effects without the voices: Demucs on fal splits the soundtrack into stems, and
+    everything except the vocals is mixed back together."""
+    small = job_dir / "for-stems.mp3"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(audio), "-b:a", "192k", str(small)],
+                   check=True, capture_output=True, timeout=180)
+    result = _fal_run(FAL_STEMS_MODEL, {
+        "audio_url": _fal_file_url(small, "audio/mpeg"),
+        "model": "htdemucs",
+        "stems": ["drums", "bass", "other"],
+        "output_format": "mp3",
+    }, time.monotonic() + STEMS_TIMEOUT_SECONDS, "stems")
+    stems = []
+    for name in ("drums", "bass", "other"):
+        url = (result.get(name) or {}).get("url")
+        if url:
+            stems.append(_download(url, job_dir / f"stem-{name}.mp3"))
+    if not stems:
+        raise RuntimeError("the stem model returned no stems")
+    out = job_dir / "background.wav"
+    inputs = [arg for stem in stems for arg in ("-i", str(stem))]
+    labels = "".join(f"[{i}:a]" for i in range(len(stems)))
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", *inputs, "-filter_complex",
+                    f"{labels}amix=inputs={len(stems)}:duration=longest:normalize=0[out]",
+                    "-map", "[out]", "-ac", "2", "-ar", str(VOICE_RATE), str(out)],
+                   check=True, capture_output=True, timeout=180)
+    return out
+
+
+def _decode_line(path: Path, tempo: float) -> "np.ndarray":
+    import numpy as np
+    filters = [f"atempo={tempo:.3f}"] if tempo > 1.001 else []
+    cmd = ["ffmpeg", "-loglevel", "error", "-i", str(path), *(["-af", ",".join(filters)] if filters else []),
+           "-f", "s16le", "-ac", "1", "-ar", str(VOICE_RATE), "-"]
+    raw = subprocess.run(cmd, check=True, capture_output=True, timeout=60).stdout
+    return np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+
+
+def voice_track(lines: list[DubLine], paths: list[Path], total: float, out: Path) -> Path:
+    """All the new lines on one track, each starting where the original line did. A line that runs
+    into the next one is sped up a little (at most MAX_SPEEDUP)."""
+    import numpy as np
+    import wave
+    buffer = np.zeros(int(total * VOICE_RATE) + VOICE_RATE, dtype=np.float32)
+    order = sorted(range(len(lines)), key=lambda i: lines[i].start)
+    for rank, i in enumerate(order):
+        line = lines[i]
+        next_start = lines[order[rank + 1]].start if rank + 1 < len(order) else total
+        room = max(next_start - line.start, line.end - line.start, 0.3)
+        length = probe_duration(paths[i]) or room
+        tempo = min(MAX_SPEEDUP, length / room) if length > room else 1.0
+        pcm = _decode_line(paths[i], tempo)
+        at = int(line.start * VOICE_RATE)
+        end = min(at + len(pcm), len(buffer))
+        buffer[at:end] += pcm[: end - at]
+    peak = float(np.max(np.abs(buffer))) or 1.0
+    if peak > 32000:
+        buffer *= 32000 / peak
+    with wave.open(str(out), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(VOICE_RATE)
+        w.writeframes(buffer.astype(np.int16).tobytes())
+    return out
+
+
+def _ass_time(seconds: float) -> str:
+    cs = int(round(seconds * 100))
+    return f"{cs // 360000}:{cs // 6000 % 60:02d}:{cs // 100 % 60:02d}.{cs % 100:02d}"
+
+
+def subtitle_file(lines: list[DubLine], width: int, height: int, bottom_margin: int, out: Path) -> Path:
+    """An ASS subtitle file: bold white text with a dark outline, centred in the covered band."""
+    size = max(28, round(height * 0.042))
+    rows = ["[Script Info]", "ScriptType: v4.00+", f"PlayResX: {width}", f"PlayResY: {height}", "WrapStyle: 0", "",
+            "[V4+ Styles]",
+            "Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, Alignment, "
+            "MarginL, MarginR, MarginV, BorderStyle, Outline, Shadow",
+            f"Style: Default,Liberation Sans,{size},&H00FFFFFF,&H00000000,&H64000000,-1,2,"
+            f"{round(width * 0.06)},{round(width * 0.06)},{bottom_margin},1,{max(2, size // 14)},0",
+            "", "[Events]", "Format: Layer, Start, End, Style, Text"]
+    for line in sorted(lines, key=lambda l: l.start):
+        text = (line.text or "").replace("\n", " ").replace("{", "(").replace("}", ")").strip()
+        if text:
+            rows.append(f"Dialogue: 0,{_ass_time(line.start)},{_ass_time(line.end)},Default,{text}")
+    out.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    return out
+
+
+@app.post("/dub/render")
+def dub_render(req: DubRenderRequest, background: BackgroundTasks,
+               authorization: Optional[str] = Header(None)) -> StreamingResponse:
+    _check_token(authorization)
+    src = source_video(req.driveUrl)
+    total = probe_duration(src)
+    if not total:
+        raise HTTPException(400, "That file isn't a video we can read.")
+    if req.coverBottom <= req.coverTop:
+        raise HTTPException(400, "The subtitle cover's bottom edge must be below its top edge.")
+    job_dir = Path(tempfile.mkdtemp(prefix=f"dub-{uuid.uuid4().hex[:8]}-"))
+    background.add_task(shutil.rmtree, job_dir, ignore_errors=True)
+    if not _render_lock.acquire(timeout=5):
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(429, "Another video is rendering. Try again in a minute.")
+    try:
+        paths = []
+        for n, line in enumerate(req.lines):
+            raw, ext = decode_data_url(line.audio, "audio/")
+            path = job_dir / f"line-{n:03d}{ext}"
+            path.write_bytes(raw)
+            paths.append(path)
+        voices = voice_track(req.lines, paths, total, job_dir / "voices.wav")
+
+        bed_note = "off"
+        bed: Optional[Path] = None
+        if req.keepBackground:
+            if FAL_KEY:
+                original = job_dir / "original.wav"
+                subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(src), "-vn", "-ac", "2",
+                                "-ar", str(VOICE_RATE), str(original)], check=True, capture_output=True, timeout=300)
+                try:
+                    bed, bed_note = background_track(original, job_dir), "kept"
+                except Exception as exc:  # fal down or slow: deliver the voices alone rather than fail
+                    print(f"[dub] background not separated: {exc}", flush=True)
+                    bed_note = "failed"
+            else:
+                bed_note = "unavailable"
+
+        soundtrack = job_dir / "soundtrack.wav"
+        if bed:
+            graph = ("[0:a]aformat=channel_layouts=stereo,volume=0.9[bed];[1:a]aformat=channel_layouts=stereo[v];"
+                     "[bed][v]amix=inputs=2:duration=longest:normalize=0,alimiter=limit=0.95[out]")
+            cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(bed), "-i", str(voices),
+                   "-filter_complex", graph, "-map", "[out]", "-t", f"{total:.3f}", str(soundtrack)]
+        else:
+            cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(voices), "-ac", "2", "-t", f"{total:.3f}",
+                   str(soundtrack)]
+        subprocess.run(cmd, check=True, capture_output=True, timeout=300)
+
+        width, height = probe_size(src)
+        top, bottom = req.coverTop, req.coverBottom
+        steps = []
+        if req.coverSubtitles:
+            band = f"crop=iw:trunc(ih*{bottom - top:.4f}/2)*2:0:trunc(ih*{top:.4f}/2)*2"
+            steps.append(f"[0:v]split[base][cut];[cut]{band},boxblur=24:3[blur];"
+                         f"[base][blur]overlay=0:trunc(H*{top:.4f}/2)*2,"
+                         f"drawbox=x=0:y=ih*{top:.4f}:w=iw:h=ih*{bottom - top:.4f}:color=black@0.35:t=fill[v1]")
+        else:
+            steps.append("[0:v]null[v1]")
+        if req.subtitles and any((l.text or "").strip() for l in req.lines):
+            # Centre the new subtitles in the covered band (or near the bottom when nothing is covered).
+            margin = round(height * (1 - bottom) + height * (bottom - top) * 0.25) if req.coverSubtitles \
+                else round(height * 0.08)
+            subs = subtitle_file(req.lines, width, height, margin, job_dir / "subs.ass")
+            steps.append(f"[v1]ass={subs.name}[vout]")
+        else:
+            steps.append("[v1]null[vout]")
+        out = job_dir / "dubbed.mp4"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(src), "-i", str(soundtrack),
+                        "-filter_complex", ";".join(steps), "-map", "[vout]", "-map", "1:a",
+                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+                        "-c:a", "aac", "-b:a", "192k", "-shortest", str(out)],
+                       check=True, capture_output=True, timeout=900, cwd=job_dir)
+    except subprocess.CalledProcessError as exc:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(500, f"Dubbing failed: {(exc.stderr or b'')[-400:]!r}") from exc
+    except Exception:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise
+    finally:
+        _render_lock.release()
+    return video_response(out, "dubbed.mp4", {"X-Dub-Background": bed_note})

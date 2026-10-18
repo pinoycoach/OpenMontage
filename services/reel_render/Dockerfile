@@ -20,7 +20,7 @@ COPY services/reel_render/requirements.txt services/reel_render/requirements.txt
 RUN python3 -m venv /venv && /venv/bin/pip install --no-cache-dir -r services/reel_render/requirements.txt
 # Download the speech model at build time so the first render doesn't wait for it.
 ENV HF_HOME=/models WHISPER_MODEL=base
-RUN /venv/bin/python -c "from faster_whisper import WhisperModel; WhisperModel('base', device='cpu', compute_type='int8')"
+RUN /venv/bin/python -c "from faster_whisper import WhisperModel; WhisperModel('base', device='cpu', compute_type='int8'); WhisperModel('small', device='cpu', compute_type='int8')"
 
 COPY remotion-composer remotion-composer
 COPY services services

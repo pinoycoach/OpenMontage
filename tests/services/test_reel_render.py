@@ -532,3 +532,100 @@ class TestClips:
             rr._download_drive("abc", tmp_path / "v.video")
         assert "Anyone with the link" in exc.value.detail
         assert not (tmp_path / "v.video").exists()
+
+
+class TestDub:
+    def _tone(self, path: Path, seconds: float, freq: int = 300) -> Path:
+        import subprocess
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                        f"sine=frequency={freq}:duration={seconds}", str(path)], check=True)
+        return path
+
+    def _line(self, start, end, text="Kumusta"):
+        return rr.DubLine(start=start, end=end, audio=PNG_URL.replace("image/png", "audio/mpeg"), text=text)
+
+    def test_voice_track_places_lines_and_speeds_up_long_ones(self, tmp_path: Path):
+        import wave
+        a = self._tone(tmp_path / "a.mp3", 1.0)
+        b = self._tone(tmp_path / "b.mp3", 3.0)  # only 2 s of room before the end of the video
+        lines = [self._line(0.5, 1.5), self._line(2.0, 3.5)]
+        out = rr.voice_track(lines, [a, b], 4.0, tmp_path / "voices.wav")
+        with wave.open(str(out)) as w:
+            assert w.getframerate() == rr.VOICE_RATE and w.getnchannels() == 1
+            assert w.getnframes() >= 4 * rr.VOICE_RATE
+        import numpy as np
+        pcm = np.frombuffer(wave.open(str(out)).readframes(10**8), dtype=np.int16)
+        rate = rr.VOICE_RATE
+        assert np.abs(pcm[: int(0.4 * rate)]).max() < 50  # silence before the first line
+        assert np.abs(pcm[int(0.7 * rate): int(1.3 * rate)]).max() > 1000  # first line playing
+        # 3 s line squeezed by at most 1.35x into 2 s of room: it still reaches past 4 s * (no further than the buffer)
+        assert np.abs(pcm[int(2.2 * rate): int(3.8 * rate)]).max() > 1000
+
+    def test_subtitle_file(self, tmp_path: Path):
+        out = rr.subtitle_file([self._line(1.0, 2.5, "Ano {ito}?"), self._line(0.0, 0.8, "")], 720, 1280, 120,
+                               tmp_path / "s.ass")
+        text = out.read_text()
+        assert "PlayResY: 1280" in text
+        assert "Dialogue: 0,0:00:01.00,0:00:02.50,Default,Ano (ito)?" in text
+        assert text.count("Dialogue:") == 1  # empty lines are skipped
+
+    def test_render_with_background_and_cover(self, tmp_path: Path, monkeypatch):
+        import subprocess
+        src = tmp_path / "src.mp4"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=blue:s=360x640:d=3",
+                        "-f", "lavfi", "-i", "sine=frequency=200:duration=3", "-c:v", "libx264", "-pix_fmt",
+                        "yuv420p", "-c:a", "aac", "-shortest", str(src)], check=True)
+        stem = self._tone(tmp_path / "stem.mp3", 3.0, 120)
+        voice = self._tone(tmp_path / "v.mp3", 1.0, 600)
+        monkeypatch.setattr(rr, "RENDER_TOKEN", "secret")
+        monkeypatch.setattr(rr, "FAL_KEY", "k")
+        monkeypatch.setattr(rr, "source_video", lambda url: src)
+        monkeypatch.setattr(rr, "_fal_file_url", lambda path, mime: "https://cdn/x.mp3")
+        sent = {}
+
+        def fake_run(model, body, deadline, tag):
+            sent.update(body, model=model)
+            return {n: {"url": f"https://cdn/{n}.mp3"} for n in ("drums", "bass", "other")}
+
+        monkeypatch.setattr(rr, "_fal_run", fake_run)
+        monkeypatch.setattr(rr, "_download", lambda url, out: (out.write_bytes(stem.read_bytes()), out)[1])
+        audio = "data:audio/mpeg;base64," + base64.b64encode(voice.read_bytes()).decode()
+        body = {"driveUrl": "https://drive.google.com/file/d/abc/view",
+                "lines": [{"start": 0.5, "end": 1.5, "audio": audio, "text": "Para kay Tala?"}]}
+        res = TestClient(rr.app).post("/dub/render", json=body, headers={"Authorization": "Bearer secret"})
+        assert res.status_code == 200, res.text[:500]
+        assert res.headers["x-dub-background"] == "kept"
+        assert sent["model"] == rr.FAL_STEMS_MODEL and "vocals" not in sent["stems"]
+        out = tmp_path / "out.mp4"
+        out.write_bytes(res.content)
+        assert abs(rr.probe_duration(out) - 3.0) < 0.2
+
+    def test_render_rejects_bad_cover(self, monkeypatch, tmp_path: Path):
+        monkeypatch.setattr(rr, "RENDER_TOKEN", "secret")
+        monkeypatch.setattr(rr, "source_video", lambda url: tmp_path / "missing.mp4")
+        monkeypatch.setattr(rr, "probe_duration", lambda p: 3.0)
+        body = {"driveUrl": "x", "coverTop": 0.9, "coverBottom": 0.8,
+                "lines": [{"start": 0, "end": 1, "audio": "data:audio/mpeg;base64,AAAA"}]}
+        res = TestClient(rr.app).post("/dub/render", json=body, headers={"Authorization": "Bearer secret"})
+        assert res.status_code == 400
+
+    def test_transcribe_uses_chinese_and_dub_model(self, tmp_path: Path, monkeypatch):
+        import subprocess
+        src = tmp_path / "src.mp4"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=red:s=320x568:d=2",
+                        "-f", "lavfi", "-i", "sine=duration=2", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                        "-c:a", "aac", "-shortest", str(src)], check=True)
+        monkeypatch.setattr(rr, "RENDER_TOKEN", "secret")
+        monkeypatch.setattr(rr, "source_video", lambda url: src)
+        seen = {}
+
+        def fake_segments(path, language=None, model_name=None):
+            seen.update(language=language, model=model_name)
+            return [{"start": 0.0, "end": 1.0, "text": "你好"}]
+
+        monkeypatch.setattr(rr, "transcribe_segments", fake_segments)
+        res = TestClient(rr.app).post("/dub/transcribe", json={"driveUrl": "x"}, headers={"Authorization": "Bearer secret"})
+        assert res.status_code == 200
+        data = res.json()
+        assert data["segments"][0]["text"] == "你好" and data["width"] == 320 and data["height"] == 568
+        assert seen == {"language": "zh", "model": rr.DUB_WHISPER_MODEL}

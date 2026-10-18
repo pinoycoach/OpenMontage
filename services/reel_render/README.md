@@ -148,6 +148,23 @@ Limits: `MAX_SOURCE_MINUTES` (default 90), `MAX_SOURCE_MB` (default 3000), clips
 Downloaded videos live in memory on Cloud Run, so give the service 8 GiB for long sources:
 `gcloud run services update openmontage-render --region $REGION --memory 8Gi`.
 
+## Dub (one episode at a time)
+
+`POST /dub/transcribe {driveUrl, language}` returns the episode's lines in its own language
+(`language` defaults to `zh`; transcribed with `DUB_WHISPER_MODEL`, default `small`), plus the frame
+size. The app translates the lines and makes the new voices.
+
+`POST /dub/render {driveUrl, lines: [{start, end, audio, text}], keepBackground, coverSubtitles,
+coverTop, coverBottom, subtitles}` lays each new voice line (an audio data URL) where the original
+line started, speeding it up by at most 1.35x if it would run into the next line.
+- `keepBackground` splits the original soundtrack with Demucs on fal (`FAL_STEMS_MODEL`, about
+  $0.0007 per second) and keeps the music and effects without the voices.
+- `coverSubtitles` blurs and darkens the band between `coverTop` and `coverBottom` (fractions of the
+  frame height) where the old burned-in subtitles sit.
+- `subtitles` burns the new `text` lines into that band.
+
+The header `X-Dub-Background` says `kept`, `failed`, `unavailable` (no fal key) or `off`.
+
 ## Speed
 
 In testing, a 10-second reel took about 27 seconds on 4 CPUs, plus a few seconds to transcribe
