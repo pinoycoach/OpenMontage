@@ -631,6 +631,25 @@ class TestDub:
         assert seen == {"language": "zh", "model": rr.DUB_WHISPER_MODEL}
         assert data["frames"] and data["frames"][0].startswith("data:image/jpeg;base64,")
         assert "pitch" in data["segments"][0]
+        assert "subtitleBand" in data
+
+    def test_find_subtitle_band_spots_outlined_text_rows(self):
+        import numpy as np
+        rng = np.random.default_rng(1)
+
+        def still(with_text: bool):
+            img = rng.integers(70, 200, size=(640, 360), dtype=np.uint8)  # a changing scene
+            if with_text:
+                for x in range(40, 320, 12):  # white strokes with dark outlines at 64-68% height
+                    img[410:436, x - 3: x] = 20
+                    img[410:436, x: x + 4] = 250
+                    img[410:436, x + 4: x + 7] = 20
+            return img
+
+        band = rr.find_subtitle_band([still(True), still(True), still(False), still(True)])
+        assert band and 0.6 <= band["top"] <= 0.645 and 0.68 <= band["bottom"] <= 0.72
+        assert isinstance(band["top"], float)
+        assert rr.find_subtitle_band([still(False), still(False), still(False)]) is None
 
     def test_segment_pitch_tells_low_from_high_voices(self, tmp_path: Path):
         import subprocess
