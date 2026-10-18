@@ -973,6 +973,53 @@ class DubRenderRequest(BaseModel):
     subtitles: bool = True
 
 
+def segment_pitch(audio: Path, segments: list[dict]) -> None:
+    """Add a rough voice pitch (Hz) to each segment, from the 16 kHz mono track: the median of the
+    autocorrelation pitch over voiced 40 ms frames. Men speak around 85-160 Hz, women 165-260 Hz;
+    with music underneath it's a hint, not a measurement."""
+    import numpy as np
+    import wave
+    with wave.open(str(audio)) as w:
+        rate = w.getframerate()
+        pcm = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768
+    win, hop = int(rate * 0.04), int(rate * 0.02)
+    lo, hi = int(rate / 400), int(rate / 70)  # lags for 70-400 Hz
+    for seg in segments:
+        chunk = pcm[int(seg["start"] * rate): int(seg["end"] * rate)]
+        starts = list(range(0, max(0, len(chunk) - win), hop))
+        if len(starts) > 40:  # 40 evenly spaced frames per line is plenty for a median
+            starts = [starts[int(i * (len(starts) - 1) / 39)] for i in range(40)]
+        pitches = []
+        for at in starts:
+            frame = chunk[at: at + win]
+            frame = frame - frame.mean()
+            energy = float(np.dot(frame, frame))
+            if energy < 1e-4:
+                continue
+            spectrum = np.fft.rfft(frame, 2 * win)
+            ac = np.fft.irfft(spectrum * np.conj(spectrum))[:win]
+            lag = lo + int(np.argmax(ac[lo:hi]))
+            if ac[lag] / ac[0] > 0.45:  # clearly periodic: voiced speech
+                pitches.append(rate / lag)
+        seg["pitch"] = round(float(np.median(pitches))) if len(pitches) >= 3 else None
+
+
+def segment_frames(src: Path, segments: list[dict], count: int = 3) -> list[str]:
+    """A few small JPEG stills taken while people speak, so any burned-in subtitles are on screen."""
+    if not segments:
+        return []
+    indexes = sorted({int(i * (len(segments) - 1) / max(1, count - 1)) for i in range(count)})
+    frames = []
+    for seg in (segments[i] for i in indexes):
+        at = (seg["start"] + seg["end"]) / 2
+        proc = subprocess.run(["ffmpeg", "-loglevel", "error", "-ss", f"{at:.2f}", "-i", str(src), "-frames:v", "1",
+                               "-vf", "scale=-2:640", "-q:v", "5", "-f", "image2", "-c:v", "mjpeg", "-"],
+                              capture_output=True, timeout=60)
+        if proc.returncode == 0 and proc.stdout:
+            frames.append("data:image/jpeg;base64," + base64.b64encode(proc.stdout).decode())
+    return frames
+
+
 @app.post("/dub/transcribe")
 def dub_transcribe(req: DubTranscribeRequest, authorization: Optional[str] = Header(None)) -> dict:
     _check_token(authorization)
@@ -987,8 +1034,13 @@ def dub_transcribe(req: DubTranscribeRequest, authorization: Optional[str] = Hea
         subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(src), "-vn", "-ac", "1", "-ar", "16000",
                         str(audio)], check=True, capture_output=True, timeout=600)
         segments = transcribe_segments(audio, language=req.language or None, model_name=DUB_WHISPER_MODEL)
+        try:
+            segment_pitch(audio, segments)
+        except Exception as exc:  # a hint only; never fail the transcript over it
+            print(f"[dub] pitch estimate skipped: {exc}", flush=True)
     width, height = probe_size(src)
-    return {"duration": round(duration, 2), "width": width, "height": height, "segments": segments}
+    return {"duration": round(duration, 2), "width": width, "height": height, "segments": segments,
+            "frames": segment_frames(src, segments)}
 
 
 def background_track(audio: Path, job_dir: Path) -> Path:
