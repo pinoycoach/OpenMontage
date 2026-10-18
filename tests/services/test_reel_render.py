@@ -569,7 +569,9 @@ class TestDub:
         assert "Dialogue: 0,0:00:01.00,0:00:02.50,Default,Ano (ito)?" in text
         assert text.count("Dialogue:") == 1  # empty lines are skipped
 
-    def test_render_with_background_and_cover(self, tmp_path: Path, monkeypatch):
+    # A thin band (one subtitle line found by find_subtitle_band) once broke boxblur's radius limit.
+    @pytest.mark.parametrize("band", [(0.78, 0.94), (0.632, 0.701), (0.65, 0.67)])
+    def test_render_with_background_and_cover(self, tmp_path: Path, monkeypatch, band):
         import subprocess
         src = tmp_path / "src.mp4"
         subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=blue:s=360x640:d=3",
@@ -591,6 +593,7 @@ class TestDub:
         monkeypatch.setattr(rr, "_download", lambda url, out: (out.write_bytes(stem.read_bytes()), out)[1])
         audio = "data:audio/mpeg;base64," + base64.b64encode(voice.read_bytes()).decode()
         body = {"driveUrl": "https://drive.google.com/file/d/abc/view",
+                "coverTop": band[0], "coverBottom": band[1],
                 "lines": [{"start": 0.5, "end": 1.5, "audio": audio, "text": "Para kay Tala?"}]}
         res = TestClient(rr.app).post("/dub/render", json=body, headers={"Authorization": "Bearer secret"})
         assert res.status_code == 200, res.text[:500]
