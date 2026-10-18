@@ -1077,6 +1077,26 @@ def segment_subtitle_band(src: Path, segments: list[dict], count: int = 5) -> Op
     return find_subtitle_band([_gray_still(src, (segments[i]["start"] + segments[i]["end"]) / 2) for i in indexes])
 
 
+def segment_subtitle_crops(src: Path, segments: list[dict], band: dict) -> None:
+    """Add to each segment a small JPEG of the burned-in subtitle band at its midpoint, so the translator
+    can read what the subtitle says when the speech recognition mishears a word."""
+    top, bottom = band["top"], band["bottom"]
+
+    def crop(seg: dict) -> Optional[str]:
+        at = (seg["start"] + seg["end"]) / 2
+        vf = f"crop=iw:ih*{bottom - top:.4f}:0:ih*{top:.4f},scale=480:-2"
+        proc = subprocess.run(["ffmpeg", "-loglevel", "error", "-ss", f"{at:.2f}", "-i", str(src), "-frames:v", "1",
+                               "-vf", vf, "-q:v", "6", "-f", "image2", "-c:v", "mjpeg", "-"],
+                              capture_output=True, timeout=60)
+        if proc.returncode or not proc.stdout:
+            return None
+        return "data:image/jpeg;base64," + base64.b64encode(proc.stdout).decode()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        for seg, image in zip(segments, pool.map(crop, segments)):
+            seg["subtitleImage"] = image
+
+
 @app.post("/dub/transcribe")
 def dub_transcribe(req: DubTranscribeRequest, authorization: Optional[str] = Header(None)) -> dict:
     _check_token(authorization)
@@ -1101,6 +1121,11 @@ def dub_transcribe(req: DubTranscribeRequest, authorization: Optional[str] = Hea
     except Exception as exc:  # a hint only
         print(f"[dub] subtitle search skipped: {exc}", flush=True)
         band = None
+    if band:
+        try:
+            segment_subtitle_crops(src, segments, band)
+        except Exception as exc:  # a hint only
+            print(f"[dub] subtitle crops skipped: {exc}", flush=True)
     return {"duration": round(duration, 2), "width": width, "height": height, "segments": segments,
             "frames": segment_frames(src, segments), "subtitleBand": band}
 

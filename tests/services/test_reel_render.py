@@ -651,6 +651,15 @@ class TestDub:
         assert isinstance(band["top"], float)
         assert rr.find_subtitle_band([still(False), still(False), still(False)]) is None
 
+    def test_segment_subtitle_crops_adds_a_small_image_per_line(self, tmp_path: Path):
+        import subprocess
+        src = tmp_path / "src.mp4"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=blue:s=320x568:d=2",
+                        "-c:v", "libx264", "-pix_fmt", "yuv420p", str(src)], check=True)
+        segs = [{"start": 0.0, "end": 0.8}, {"start": 1.0, "end": 1.8}]
+        rr.segment_subtitle_crops(src, segs, {"top": 0.6, "bottom": 0.7})
+        assert all(s["subtitleImage"].startswith("data:image/jpeg;base64,") for s in segs)
+
     def test_segment_pitch_tells_low_from_high_voices(self, tmp_path: Path):
         import subprocess
         audio = tmp_path / "a.wav"
