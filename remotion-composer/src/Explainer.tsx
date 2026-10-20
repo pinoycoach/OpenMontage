@@ -912,6 +912,7 @@ export const Explainer: React.FC<ExplainerProps> = (props) => {
         <CaptionOverlay
           words={captions}
           holdLastPageUntilMs={props.holdLastCaption ? (durationInFrames / fps) * 1000 : undefined}
+          instant={props.captionEntrance === "none"}
           wordsPerPage={(props.captionWordsPerPage as number) ?? 6}
           fontSize={(props.captionFontSize as number) ?? 42}
           bottomOffset={(props.captionBottomOffset as number) ?? 80}

@@ -157,3 +157,23 @@ def test_preflight_straight_cut_is_not_a_dip():
     c = preflight.scene_cuts(frames)[0]
     lumas = [preflight._luma(f) for f in frames]
     assert not min(lumas[c - 2:c + 3]) < preflight.DIP_RATIO * min(lumas[c - 4], lumas[c + 4])
+
+
+def _caption_frame(bg_value: int, box: bool, text: bool):
+    import cv2
+    f = np.full((480, 270, 3), bg_value, np.uint8)
+    if box:
+        cv2.rectangle(f, (40, 330), (230, 362), (20, 20, 20), -1)
+        if text:
+            cv2.putText(f, "Comment below", (52, 352), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+    return f
+
+
+def test_caption_box_found_with_good_contrast_on_bright_frame():
+    b = preflight.caption_box(_caption_frame(235, box=True, text=True))
+    assert b and b["contrast"] >= preflight.MIN_CONTRAST and b["bg"] <= 50
+
+
+def test_no_caption_box_without_box_or_text():
+    assert preflight.caption_box(_caption_frame(235, box=False, text=False)) is None
+    assert preflight.caption_box(_caption_frame(235, box=True, text=False)) is None

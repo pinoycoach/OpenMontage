@@ -318,7 +318,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--music", type=Path, help="music bed for every reel (needs a licence file next to it)")
     ap.add_argument("--music-for", action="append", default=[], metavar="REEL=FILE",
                     help="music bed for one reel, overriding --music (repeatable)")
-    ap.add_argument("--music-volume", type=float, default=0.15, help="music level under the voice [0.15]")
+    # 0.15 left the bed about 31 dB under the voice (silent once the voice stops); 0.5 sits ~20 dB under.
+    ap.add_argument("--music-volume", type=float, default=0.5, help="music bed level, ducked under the voice [0.5]")
     ap.add_argument("--ai-label", action="store_true", help='burn in the "AI-generated" tag (AI voice or visuals)')
     ap.add_argument("--max-words", type=int, default=MAX_WORDS, help=f"word limit per script [{MAX_WORDS}]")
     ap.add_argument("--only", nargs="*", help="render only these reels")

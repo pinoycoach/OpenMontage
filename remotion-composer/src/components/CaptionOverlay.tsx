@@ -34,6 +34,8 @@ type CaptionOverlayProps = {
   bottomOffset?: number;
   /** Keep the last page on screen until this time (ms), e.g. the end of the video. */
   holdLastPageUntilMs?: number;
+  /** Show each page at full opacity at once (no fade/slide in), so it is readable on any frame. */
+  instant?: boolean;
 };
 
 interface CaptionPage {
@@ -71,18 +73,21 @@ const PageRenderer: React.FC<{
   fontFamily: string;
   wordSeparator: string;
   bottomOffset: number;
-}> = ({ page, fontSize, color, highlightColor, backgroundColor, fontFamily, wordSeparator, bottomOffset }) => {
+  instant: boolean;
+}> = ({ page, fontSize, color, highlightColor, backgroundColor, fontFamily, wordSeparator, bottomOffset, instant }) => {
   const frame = useCurrentFrame();
   const { fps } = useVideoConfig();
 
   const currentMs = page.startMs + (frame / fps) * 1000;
 
-  // Spring entrance
-  const entrance = spring({
-    frame,
-    fps,
-    config: { damping: 18, stiffness: 120 },
-  });
+  // Spring entrance (default), or none: the page and its box are fully there from the first frame
+  const entrance = instant
+    ? 1
+    : spring({
+        frame,
+        fps,
+        config: { damping: 18, stiffness: 120 },
+      });
 
   return (
     <AbsoluteFill
@@ -154,6 +159,7 @@ export const CaptionOverlay: React.FC<CaptionOverlayProps> = ({
   wordSeparator = " ",
   bottomOffset = 80,
   holdLastPageUntilMs,
+  instant = false,
 }) => {
   const { fps } = useVideoConfig();
   const pages = buildPages(words, wordsPerPage);
@@ -180,6 +186,7 @@ export const CaptionOverlay: React.FC<CaptionOverlayProps> = ({
               fontFamily={fontFamily}
               wordSeparator={wordSeparator}
               bottomOffset={bottomOffset}
+              instant={instant}
             />
           </Sequence>
         );

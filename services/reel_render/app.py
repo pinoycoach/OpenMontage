@@ -412,6 +412,8 @@ def build_props(req: RenderRequest, image_paths: list[Path], voice_path: Optiona
         # End on the last scene, with its caption still on screen.
         "tailSeconds": TAIL_SECONDS,
         "holdLastCaption": not req.endCard,
+        # Caption pages appear at full opacity at once: a fading page is unreadable on bright frames.
+        "captionEntrance": "none",
         # Big, short caption pages that sit above the Reels/TikTok UI on vertical video.
         "captionFontSize": 76 if vertical else 56,
         "captionWordsPerPage": per_page,
