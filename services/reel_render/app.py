@@ -216,7 +216,21 @@ def scene_timeline(durations: list[float], voice_seconds: Optional[float]) -> li
     return spans
 
 
-def word_captions(text: str, start: float, end: float) -> list[dict]:
+def page_breaks(count: int, per_page: int) -> set[int]:
+    """Word positions (0-based) to end a caption page after, so a line's pages are as even as possible
+    and never leave one word alone: 5 words → 3 + 2, 9 → 3 + 3 + 3. The last word always ends a page."""
+    if count <= 0:
+        return set()
+    pages = -(-count // per_page)
+    base, extra = divmod(count, pages)
+    out, k = set(), 0
+    for p in range(pages):
+        k += base + (1 if p < extra else 0)
+        out.add(k - 1)
+    return out
+
+
+def word_captions(text: str, start: float, end: float, per_page: int = 4) -> list[dict]:
     """Spread a line's words across its scene, weighted by word length."""
     words = text.split()
     if not words or end <= start:
@@ -225,6 +239,7 @@ def word_captions(text: str, start: float, end: float) -> list[dict]:
     t0, t1 = start + inset, end - inset
     weights = [len(w) + 2 for w in words]
     total = sum(weights)
+    breaks = page_breaks(len(words), per_page)
     out, t = [], t0
     for i, (w, wt) in enumerate(zip(words, weights)):
         dt = (t1 - t0) * wt / total
@@ -232,7 +247,7 @@ def word_captions(text: str, start: float, end: float) -> list[dict]:
             "word": w,
             "startMs": round(t * 1000),
             "endMs": round((t + dt) * 1000),
-            "pageBreakAfter": i == len(words) - 1,
+            "pageBreakAfter": i in breaks,
         })
         t += dt
     return out
@@ -325,6 +340,7 @@ def build_props(req: RenderRequest, image_paths: list[Path], voice_path: Optiona
                 heard: Optional[list[tuple[str, float, float]]] = None) -> dict:
     spans = scene_timeline([s.durationSeconds for s in req.scenes], voice_seconds)
     vertical = req.aspectRatio == "9:16"
+    per_page = 4 if vertical else 6  # caption words per page
 
     # Exact timing: line the heard words up with the script, then cut scenes between lines.
     exact: Optional[list[tuple[float, float]]] = None
@@ -357,13 +373,14 @@ def build_props(req: RenderRequest, image_paths: list[Path], voice_path: Optiona
             cut["card"] = scene.card.model_dump(exclude_none=True)
         cuts.append(cut)
         words = lines[i]
+        breaks = page_breaks(len(words), per_page)
         if req.captions and exact:
             for n, word in enumerate(words):
                 t0, t1 = exact[word_index + n]
                 captions.append({"word": word, "startMs": round(t0 * 1000), "endMs": round(t1 * 1000),
-                                 "pageBreakAfter": n == len(words) - 1})
+                                 "pageBreakAfter": n in breaks})
         elif req.captions:
-            captions.extend(word_captions(" ".join(words), start, end))
+            captions.extend(word_captions(" ".join(words), start, end, per_page))
         word_index += len(words)
 
     props: dict = {
@@ -375,14 +392,15 @@ def build_props(req: RenderRequest, image_paths: list[Path], voice_path: Optiona
         "plainBackground": True,
         # Big, short caption pages that sit above the Reels/TikTok UI on vertical video.
         "captionFontSize": 76 if vertical else 56,
-        "captionWordsPerPage": 4 if vertical else 6,
+        "captionWordsPerPage": per_page,
         "captionBottomOffset": 460 if vertical else 90,
         "themeConfig": {
             "backgroundColor": "#000000",
             "surfaceColor": "#000000",
             "textColor": "#FFFFFF",
             "captionHighlightColor": CAPTION_COLORS[req.captionStyle],
-            "captionBackgroundColor": "rgba(0, 0, 0, 0.7)",
+            # A near-solid dark box: white and yellow words stay readable on any photo.
+            "captionBackgroundColor": "rgba(0, 0, 0, 0.85)",
         },
     }
     if req.endCard and cuts:

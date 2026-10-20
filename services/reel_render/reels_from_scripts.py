@@ -42,6 +42,10 @@ VOICE_NAMES = ("voice.mp3", "voice.m4a", "voice.wav")
 MOTIONS = ["zoom-in", "pan-left", "zoom-out", "pan-right"]
 LONG_EDGE = 1920
 TARGET_LUFS = -14.0
+# The renderer's composition fades to black for 1 s after the last scene, and each scene dims over its
+# last 8 frames; the finished reel cuts both and holds the last bright frame (photo + last caption).
+END_FADE_SECONDS = 1.0 + 0.3
+END_HOLD_SECONDS = 0.5
 SILENT_LUFS = -50.0
 AI_LABEL = "AI-generated"
 FONT_CANDIDATES = [
@@ -147,10 +151,11 @@ def reel_voice(folder: Path) -> Path | None:
 
 def music_licence(music: Path) -> Path:
     for candidate in (music.with_suffix(".txt"), music.parent / "LICENSE", music.parent / "LICENSE.txt",
-                      music.parent / "credits.txt"):
+                      music.parent / "credits.txt", music.parent / "MUSIC-LICENSES.md"):
         if candidate.is_file():
             return candidate
-    raise ReelError(f"No licence file for {music.name}: put {music.stem}.txt, LICENSE or credits.txt next to it.")
+    raise ReelError(f"No licence file for {music.name}: put {music.stem}.txt, LICENSE, credits.txt or "
+                    "MUSIC-LICENSES.md next to it.")
 
 
 def check_inputs(reels: list[tuple[str, str]], root: Path) -> None:
@@ -238,7 +243,8 @@ def loudness(path: Path) -> float | None:
 
 
 def finish(raw: Path, out: Path, ai_label: bool) -> None:
-    """The final file: the AI label burned in top left (when asked) and the audio at -14 LUFS."""
+    """The final file: ends on the last photo (the composer's fade to black is cut, so the last line
+    never sits alone on black), the AI label burned in top left (when asked), audio at -14 LUFS."""
     vf = []
     if ai_label:
         font = find_font()
@@ -249,16 +255,27 @@ def finish(raw: Path, out: Path, ai_label: bool) -> None:
     af = []
     if lufs is not None and lufs > SILENT_LUFS:  # never boost a silent (captions-only) track
         af = [f"volume={TARGET_LUFS - lufs:.2f}dB", "alimiter=limit=0.84:level=false"]
+    total = probe_seconds(raw) or 0.0
+    keep = max(total - END_FADE_SECONDS, 1.0) if total else None
+    if keep:
+        vf.insert(0, f"trim=duration={keep:.3f},tpad=stop_mode=clone:stop_duration={END_HOLD_SECONDS}")
+        af.append(f"atrim=duration={keep + END_HOLD_SECONDS:.3f}")
+        af.append(f"afade=t=out:st={max(keep + END_HOLD_SECONDS - 0.4, 0):.2f}:d=0.4")  # no click at the end
     cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(raw)]
     if vf:
-        cmd += ["-vf", ",".join(vf), "-c:v", "libx264", "-preset", "slow", "-crf", "18", "-pix_fmt", "yuv420p"]
-    else:
-        cmd += ["-c:v", "copy"]
-    if af:
+        cmd += ["-vf", ",".join(vf)]
+    cmd += ["-c:v", "libx264", "-preset", "slow", "-crf", "18", "-pix_fmt", "yuv420p"]
+    if af and _has_audio(raw):
         cmd += ["-af", ",".join(af), "-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
     else:
         cmd += ["-c:a", "copy"]
     subprocess.run(cmd + ["-movflags", "+faststart", str(out)], check=True, capture_output=True, timeout=900)
+
+
+def _has_audio(path: Path) -> bool:
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index",
+                          "-of", "csv=p=0", str(path)], capture_output=True, text=True, timeout=60).stdout
+    return bool(out.strip())
 
 
 def render_in_process(body: dict, out: Path) -> dict:
@@ -295,7 +312,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("scripts", type=Path, help="file with one '## <slug>' section per reel")
     ap.add_argument("reels", type=Path, help="folder with one sub-folder of images per reel")
     ap.add_argument("out", type=Path, help="where the MP4s, credits.txt and report.txt go")
-    ap.add_argument("--music", type=Path, help="music bed (needs a licence file next to it)")
+    ap.add_argument("--music", type=Path, help="music bed for every reel (needs a licence file next to it)")
+    ap.add_argument("--music-for", action="append", default=[], metavar="REEL=FILE",
+                    help="music bed for one reel, overriding --music (repeatable)")
     ap.add_argument("--music-volume", type=float, default=0.15, help="music level under the voice [0.15]")
     ap.add_argument("--ai-label", action="store_true", help='burn in the "AI-generated" tag (AI voice or visuals)')
     ap.add_argument("--max-words", type=int, default=MAX_WORDS, help=f"word limit per script [{MAX_WORDS}]")
@@ -309,9 +328,17 @@ def main(argv: list[str] | None = None) -> int:
             if not reels:
                 raise ReelError("None of the --only reels are in the scripts file.")
         check_inputs(reels, args.reels)
-        if args.music and not args.music.is_file():
-            raise ReelError(f"No music file at {args.music}.")
-        licence = music_licence(args.music) if args.music else None
+        music_by_reel = {slug: args.music for slug, _ in reels}
+        for item in args.music_for:
+            slug, sep, path = item.partition("=")
+            if not sep or slug not in music_by_reel:
+                raise ReelError(f'--music-for needs REEL=FILE with a reel from the scripts file, not "{item}".')
+            music_by_reel[slug] = Path(path)
+        licences: dict[Path, Path] = {}
+        for music in {m for m in music_by_reel.values() if m}:
+            if not music.is_file():
+                raise ReelError(f"No music file at {music}.")
+            licences[music] = music_licence(music)
     except ReelError as exc:
         print(f"Stopped: {exc}", file=sys.stderr)
         return 2
@@ -328,7 +355,7 @@ def main(argv: list[str] | None = None) -> int:
         with tempfile.TemporaryDirectory(prefix=f"reel-{slug}-") as tmp:
             work = Path(tmp)
             try:
-                body = build_request(script, images, voice, args.music, work, args.music_volume)
+                body = build_request(script, images, voice, music_by_reel[slug], work, args.music_volume)
                 raw = work / "raw.mp4"
                 render_in_process(body, raw)
                 final = args.out / f"{slug}.mp4"
@@ -344,9 +371,11 @@ def main(argv: list[str] | None = None) -> int:
                       f"{video.get('r_frame_rate')}, {float(info.get('format', {}).get('duration', 0)):.1f} s video, "
                       f"made in {seconds:.0f} s, paid calls $0.00, loudness {loudness(final)} LUFS")
         credits += [f"== {slug} ==", (folder / "credits.txt").read_text(encoding="utf-8").strip(), ""]
+        if music_by_reel[slug]:
+            credits += [f"Music for {slug}: {music_by_reel[slug].name}", ""]
         print(f"[{slug}] done in {seconds:.0f} s -> {final}")
-    if licence:
-        credits += ["== music ==", f"{args.music.name}", licence.read_text(encoding="utf-8").strip(), ""]
+    for music, licence in licences.items():
+        credits += ["== music ==", f"{music.name}", licence.read_text(encoding="utf-8").strip(), ""]
     if args.ai_label:
         credits += ["== label ==", f'"{AI_LABEL}" is shown on screen (AI voice or AI visuals).', ""]
     (args.out / "credits.txt").write_text("\n".join(credits), encoding="utf-8")
