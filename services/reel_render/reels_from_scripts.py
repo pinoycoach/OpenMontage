@@ -390,6 +390,9 @@ def main(argv: list[str] | None = None) -> int:
                       f"made in {seconds:.0f} s, paid calls in this run $0.00, loudness {loudness(final)} LUFS, "
                       f"preflight {'PASS' if not fails else f'{len(fails)} FAIL'}")
         credits += [f"== {slug} ==", (folder / "credits.txt").read_text(encoding="utf-8").strip(), ""]
+        if clips:  # derivative works: say what was changed (CC BY / BY-SA)
+            credits += [f"Changes: {', '.join(images[i].name for i in sorted(clips))} animated into short "
+                        "clips with an AI video model; plates, faces and small text blurred where needed.", ""]
         if music_by_reel[slug]:
             credits += [f"Music for {slug}: {music_by_reel[slug].name}", ""]
         print(f"[{slug}] done in {seconds:.0f} s -> {final}")
