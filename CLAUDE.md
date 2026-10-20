@@ -83,6 +83,8 @@ Goal: 1–2 revisions at most. Don't send a reel to Ben until every box passes. 
 **Send to Ben:** for each reel, the MP4, the 2 fps contact sheet and the preflight lines. List any known leftovers honestly.
 **Merge rule:** PRs that change the live renderer are merged by Nap only after a run passes Ben's QA with zero fails.
 
+**Free reel runs (Nap, 20 Oct 2026):** once Nap has said go on a batch, keep producing from start to finish. Pause and ask only when no usable free image can be found for a reel; log that reel as pending in the ledger and carry on with the rest. Hard fails go to `fix-after-friday/` with the reason, never re-edited. Every finished reel goes in the ledger with its cost. Sending, posting, Drive uploads and merges still need their own yes.
+
 ### Google Cloud $300 credit rule (Nap approved 20 Oct 2026)
 Goal: the credits must turn into revenue, not experiments. The credit expires 5 Jan 2027.
 1. **Veo Fast (about $9–14 a reel) is ONLY for remaking a reel that beat 2× views:** 936 views on @callmenapoleon, or 728 on DigitallyManila. Never on a first post. Every Veo shot still needs Nap's yes, with the cost shown first.
