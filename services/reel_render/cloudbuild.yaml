@@ -16,7 +16,7 @@ steps:
         set -e
         apt-get update -qq && apt-get install -y -qq --no-install-recommends ffmpeg > /dev/null
         pip install --no-cache-dir -q -r services/reel_render/requirements.txt pytest==9.1.1 httpx==0.28.1
-        python -m pytest -q tests/services/test_reel_render.py
+        python -m pytest -q tests/services/test_reel_render.py tests/services/test_reels_from_scripts.py
   - name: gcr.io/cloud-builders/docker
     args:
       - build
