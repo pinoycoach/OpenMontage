@@ -189,6 +189,34 @@ line started, speeding it up by at most 1.35x if it would run into the next line
 
 The header `X-Dub-Background` says `kept`, `failed`, `unavailable` (no fal key) or `off`.
 
+## Reels from locked scripts (local, no app)
+
+`reels_from_scripts.py` makes vertical reels from scripts you've already written, on any machine that
+has the renderer's dependencies (Remotion in `remotion-composer/`, ffmpeg, faster-whisper). It runs the
+render service in-process, so it needs no server, no token and no paid API.
+
+```bash
+python services/reel_render/reels_from_scripts.py scripts.md reels/ out/ \
+    --music music/chopin.mp3 --ai-label
+```
+
+- **`scripts.md`:** one `## <name>` heading per reel, then its script (60 words or fewer).
+- **`reels/<name>/`:**
+  - that reel's images, shown in file-name order;
+  - `credits.txt` with the source and licence of every image (required);
+  - optionally `voice.mp3`, the narration of exactly that script.
+- **Music:** needs a licence file next to it (`<name>.txt`, `LICENSE` or `credits.txt`).
+- **Output in `out/`:** `<name>.mp4` (1080×1920), `credits.txt` (images, music, label) and `report.txt` (time, cost and loudness per reel).
+
+**How it treats your script and images:**
+- **Word for word:** the script is split across the images at sentence ends, and every word is kept, at least 3 per image.
+- **Timing:** captions show exactly those words, timed to the voice, and each picture changes when the narration reaches its words.
+- **No voice:** the reel is captions only.
+- **Nothing generated:** only your images are used, with a slow pan or zoom. No faces or pictures are made up.
+- **AI label:** `--ai-label` burns in the "AI-generated" tag. Use it whenever the voice or a visual is AI.
+- **Loudness:** audio is set to -14 LUFS.
+- **End:** the video ends with the composer's usual 1-second fade.
+
 ## Speed
 
 In testing, a 10-second reel took about 27 seconds on 4 CPUs, plus a few seconds to transcribe

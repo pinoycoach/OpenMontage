@@ -58,3 +58,27 @@ Applies to every project. Project CLAUDE.md files can add to this, not loosen it
 - ffmpeg `boxblur` radius must fit the strip: half its height, and chroma is half again (a fixed radius broke every dub render once).
 - Veo on fal: pin `veo3.1/fast`, `image_to_video`, 9:16, `generate_audio: false`, and the exact duration and resolution. The tool's own price estimate is wrong for Fast; the live fal price is $0.15/s (checked 18 Oct 2026; confirm the 1080p charge on the fal dashboard). Every shot needs its own yes.
 - OFW / Ep 2 look: 1080×1920, 24 fps, render at 1080 (never upscale), brownout (phone screen is the only light, room near-black, light level never changes), audio at -14 LUFS, "AI-generated" label top-left. Ate wears no hair clip (as in F01).
+
+### Reel pre-send checklist (agreed 20 Oct 2026, from Ben's QA)
+Goal: 1–2 revisions at most. Don't send a reel to Ben until every box passes. If a reel fails, recreate it (fix the input or the renderer); never hand-edit the output.
+`services/reel_render/reels_from_scripts.py` runs `preflight.py` on every reel and writes `<reel>-preflight.txt` (PASS / FAIL / MANUAL) plus `<reel>-sheet-2fps.jpg`. MANUAL items get checked by eye on the sheet before sending.
+
+**Inputs (before render)**
+- Every image cover-cropped to 9:16, with a uniform scale. Compare source and rendered frame; any non-uniform scale is a FAIL (automatic).
+- No readable licence plates, phone or hotline numbers. Blur them (by eye; check windshields, stickers and grilles too).
+- No clear face of a real, identifiable person, including drivers through windshields and faces in mirrors. Drop or blur (the face detector lists frames to look at).
+- No AI-invented text on signs, gauges or paint. Blur tiny text, keep the shot wide, or redo (by eye on every AI motion clip).
+- Each image has at least 3 script words (enforced by the split).
+
+**Render (check the output)**
+- No black or empty frames anywhere except the 0.3 s fade-in. One frame every 0.25 s plus the very last frame; mean luma under 8 is a FAIL.
+- Transitions are a straight cut or a crossfade of 0.2 s or more. No dip to black.
+- Captions on a near-solid dark box, in white or yellow text, never coloured to match the background.
+- The last caption sits on the last photo, with a hold of 0.5 s or more.
+- Music: -14 LUFS integrated, a 1.0 s fade-out, ending with the video (no hard cut).
+- Voice (when present): word for word with `scripts.md`, with the music ducked under it.
+- 1080×1920, 24 or 30 fps, under 60 s.
+- Every image's credit is in `credits.txt`.
+
+**Send to Ben:** for each reel, the MP4, the 2 fps contact sheet and the preflight lines. List any known leftovers honestly.
+**Merge rule:** PRs that change the live renderer are merged by Nap only after a run passes Ben's QA with zero fails.
