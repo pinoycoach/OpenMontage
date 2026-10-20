@@ -177,3 +177,25 @@ def test_caption_box_found_with_good_contrast_on_bright_frame():
 def test_no_caption_box_without_box_or_text():
     assert preflight.caption_box(_caption_frame(235, box=False, text=False)) is None
     assert preflight.caption_box(_caption_frame(235, box=True, text=False)) is None
+
+
+# --- review frames for the by-eye checks --------------------------------------------------------------
+import review_frames  # noqa: E402
+
+
+def test_review_samples_two_frames_per_still_and_every_second_of_a_clip():
+    times = review_frames.sample_times([0, 40, 130], 30.0, motion={1})
+    assert times[0] == [0.3, 0.97]
+    assert times[1] == [1.33, 2.33, 3.33]
+
+
+def test_review_writes_one_image_per_scene(tmp_path):
+    import cv2
+    video = tmp_path / "reel.mp4"
+    w = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"mp4v"), 30, (270, 480))
+    for v in [60] * 30 + [200] * 30:
+        w.write(np.full((480, 270, 3), v, np.uint8))
+    w.release()
+    paths = review_frames.write_review(video, tmp_path)
+    assert [p.name for p in paths] == ["reel-review-s01.jpg", "reel-review-s02.jpg"]
+    assert cv2.imread(str(paths[0])).shape == (960, 1080, 3)
