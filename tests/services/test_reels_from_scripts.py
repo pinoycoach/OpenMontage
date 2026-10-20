@@ -18,10 +18,15 @@ def test_parse_scripts_reads_every_section_in_order():
     assert reels == [("islands", "First line. Second line."), ("jeepney", SCRIPT)]
 
 
+def test_parse_scripts_takes_the_first_word_of_the_heading_as_the_folder():
+    text = "# Locked scripts\n\n## reel1 — islands\nAkala mo 7,107 islands ang Pilipinas? Mali na 'yan.\n"
+    assert rfs.parse_scripts(text) == [("reel1", "Akala mo 7,107 islands ang Pilipinas? Mali na 'yan.")]
+
+
 @pytest.mark.parametrize("text, problem", [
     ("## a\n" + " ".join(["word"] * 61), "61 words"),
     ("## a\nOne.\n## a\nTwo.", "twice"),
-    ("## bad name\nOne.", "usable reel name"),
+    ("## bad/name\nOne.", "usable reel name"),
     ("## empty\n\n## b\nTwo.", "no script"),
     ("no headings at all", "No reels"),
 ])

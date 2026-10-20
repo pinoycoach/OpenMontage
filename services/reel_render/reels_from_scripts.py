@@ -9,7 +9,8 @@ remotion-composer/, ffmpeg, faster-whisper):
     python services/reel_render/reels_from_scripts.py scripts.md reels/ out/ \
         --music music/chopin.mp3 --ai-label
 
-scripts.md holds one "## <slug>" heading per reel, then that reel's script (60 words or less):
+scripts.md holds one "## <slug>" heading per reel (anything after the first word, like "— islands", is
+just a label), then that reel's script (60 words or less):
 
     ## islands
     The Philippines has 7,641 islands. ...
@@ -41,6 +42,7 @@ VOICE_NAMES = ("voice.mp3", "voice.m4a", "voice.wav")
 MOTIONS = ["zoom-in", "pan-left", "zoom-out", "pan-right"]
 LONG_EDGE = 1920
 TARGET_LUFS = -14.0
+SILENT_LUFS = -50.0
 AI_LABEL = "AI-generated"
 FONT_CANDIDATES = [
     "/usr/share/fonts/opentype/inter/Inter-SemiBold.otf",
@@ -68,7 +70,9 @@ def parse_scripts(text: str, max_words: int = MAX_WORDS) -> list[tuple[str, str]
                 if words > max_words:
                     raise ReelError(f'Reel "{slug}" has {words} words; the limit is {max_words}.')
                 reels.append((slug, script))
-            slug, lines = heading.group(1).strip() or None, []
+            # "## reel1 — islands": the first word names the folder, the rest is a label.
+            name = heading.group(1).strip()
+            slug, lines = (name.split()[0] if name else None), []
             if slug is not None and not re.fullmatch(r"[A-Za-z0-9_-]+", slug):
                 raise ReelError(f'"{slug}" isn\'t a usable reel name: use letters, numbers, - or _.')
         elif slug is not None:
@@ -87,33 +91,46 @@ MIN_PIECE_WORDS = 3  # a picture needs about a second of speech; the renderer wo
 
 
 def split_script(script: str, parts: int) -> list[str]:
-    """The script cut into `parts` consecutive pieces of about the same length (at least 3 words each),
-    preferring cuts after a sentence end, then after a comma. Joining the pieces with spaces gives back
-    the script exactly."""
+    """The script cut into `parts` consecutive pieces (at least 3 words each). The cuts are chosen
+    together: after a sentence end if at all possible, else after a comma, and pieces of roughly equal
+    length. Joining the pieces with spaces gives back the script exactly."""
     words = script.split()
     if parts < 1:
         raise ReelError("A reel needs at least one image.")
-    if parts * MIN_PIECE_WORDS > len(words):
-        most = max(1, len(words) // MIN_PIECE_WORDS)
-        raise ReelError(f"{parts} images is too many for {len(words)} words (each image needs "
+    n = len(words)
+    if parts * MIN_PIECE_WORDS > n:
+        most = max(1, n // MIN_PIECE_WORDS)
+        raise ReelError(f"{parts} images is too many for {n} words (each image needs "
                         f"{MIN_PIECE_WORDS}+ words); use at most {most}.")
-    cuts, start = [], 0
-    for k in range(1, parts):
-        ideal = round(len(words) * k / parts)
-        lo = max(start + MIN_PIECE_WORDS, ideal - 3)
-        hi = min(len(words) - (parts - k) * MIN_PIECE_WORDS, ideal + 3)
+    target = n / parts
 
-        def score(i: int) -> tuple[int, int]:
-            end = words[i - 1]
-            kind = 0 if end[-1] in ".!?" else 1 if end[-1] in ",;:" else 2
-            return kind, abs(i - ideal)
+    def cut_cost(i: int) -> float:  # cutting after word i (1-based count of words before the cut)
+        end = words[i - 1]
+        return 0.0 if end[-1] in ".!?" or end.endswith(('."', ".'", '?"', "?'")) else 3.0 if end[-1] in ",;:" else 9.0
 
-        cut = min(range(lo, hi + 1), key=score) if lo <= hi else start + MIN_PIECE_WORDS
-        cuts.append(cut)
-        start = cut
-    bounds = [0, *cuts, len(words)]
-    pieces = [" ".join(words[a:b]) for a, b in zip(bounds, bounds[1:])]
-    assert " ".join(pieces) == " ".join(words)
+    def piece_cost(length: int) -> float:
+        return 4.0 * ((length - target) / target) ** 2
+
+    # best[k][i]: least cost to cut the first i words into k pieces.
+    INF = float("inf")
+    best = [[INF] * (n + 1) for _ in range(parts + 1)]
+    back = [[0] * (n + 1) for _ in range(parts + 1)]
+    best[0][0] = 0.0
+    for k in range(1, parts + 1):
+        for i in range(k * MIN_PIECE_WORDS, n - (parts - k) * MIN_PIECE_WORDS + 1):
+            for j in range((k - 1) * MIN_PIECE_WORDS, i - MIN_PIECE_WORDS + 1):
+                if best[k - 1][j] == INF:
+                    continue
+                c = best[k - 1][j] + piece_cost(i - j) + (cut_cost(i) if i < n else 0.0)
+                if c < best[k][i]:
+                    best[k][i], back[k][i] = c, j
+    bounds, i = [n], n
+    for k in range(parts, 0, -1):
+        i = back[k][i]
+        bounds.append(i)
+    bounds.reverse()
+    pieces = [" ".join(words[x:y]) for x, y in zip(bounds, bounds[1:])]
+    assert " ".join(pieces) == " ".join(words) and len(pieces) == parts
     return pieces
 
 
@@ -230,7 +247,7 @@ def finish(raw: Path, out: Path, ai_label: bool) -> None:
                   "boxcolor=black@0.6:boxborderw=10:x=44:y=282")
     lufs = loudness(raw)
     af = []
-    if lufs is not None:
+    if lufs is not None and lufs > SILENT_LUFS:  # never boost a silent (captions-only) track
         af = [f"volume={TARGET_LUFS - lufs:.2f}dB", "alimiter=limit=0.84:level=false"]
     cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(raw)]
     if vf:
