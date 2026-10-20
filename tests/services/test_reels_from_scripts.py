@@ -131,7 +131,7 @@ import app as renderer  # noqa: E402
 import preflight  # noqa: E402
 
 
-@pytest.mark.parametrize("count, sizes", [(1, [1]), (4, [4]), (5, [3, 2]), (7, [4, 3]), (9, [3, 3, 3]), (13, [4, 3, 3, 3])])
+@pytest.mark.parametrize("count, sizes", [(1, [1]), (4, [4]), (5, [5]), (6, [6]), (7, [4, 3]), (9, [3, 3, 3]), (13, [4, 3, 3, 3])])
 def test_caption_pages_are_balanced_and_never_one_word(count, sizes):
     breaks = sorted(renderer.page_breaks(count, 4))
     got = [b - a for a, b in zip([-1, *breaks], breaks)]
