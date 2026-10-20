@@ -74,7 +74,7 @@ def stretch_of(frame: np.ndarray, source: Path) -> float | None:
     tpl = g[int(h * 0.20):int(h * 0.62), int(w * 0.15):int(w * 0.85)]
     best = (-1.0, None)
     for sx in (0.85, 0.92, 1.0, 1.08, 1.15):
-        for zoom in (1.0, 1.06, 1.12, 1.18, 1.24):
+        for zoom in np.arange(1.0, 1.31, 0.03):  # fine steps: a coarse grid matched a zoom-in as a stretch
             k = h / src.shape[0] * zoom
             img = cv2.resize(src, (max(1, int(src.shape[1] * k * sx)), max(1, int(src.shape[0] * k))))
             if img.shape[0] < tpl.shape[0] or img.shape[1] < tpl.shape[1]:
@@ -234,9 +234,9 @@ def check_reel(video: Path, images: list[Path], clips: dict[int, Path], credits_
             dips.append(round(c / fps, 2))
     checks.append(Check("Render", "transitions are straight cuts, no dip to black", "FAIL" if dips else "PASS",
                         f"dips at {dips} s" if dips else f"{len(cuts)} cuts checked"))
-    # Every spoken line has a caption on screen: from the first caption to the end, every 0.25 s.
-    step = max(1, int(fps / 4))
-    boxes = {i: caption_box(frames[i]) for i in range(skip, len(frames), step)}
+    # Every spoken line has a caption on screen: from the first caption to the end, on every frame
+    # (sampling every 0.25 s missed a 2-3 frame caption flicker at a cut).
+    boxes = {i: caption_box(frames[i]) for i in range(skip, len(frames))}
     first = next((i for i, b in boxes.items() if b), None)
     missing_cap = [round(i / fps, 2) for i, b in boxes.items() if first is not None and i >= first and not b]
     if first is None:
@@ -244,7 +244,7 @@ def check_reel(video: Path, images: list[Path], clips: dict[int, Path], credits_
     else:
         checks.append(Check("Render", "every spoken line has a visible caption", "FAIL" if missing_cap else "PASS",
                             f"no readable caption at {missing_cap[:8]} s" if missing_cap else
-                            f"caption on screen in all {sum(1 for i in boxes if i >= first)} samples from {first / fps:.2f} s"))
+                            f"caption on screen in all {sum(1 for i in boxes if i >= first)} frames from {first / fps:.2f} s"))
     found = [b for b in boxes.values() if b]
     low = [round(i / fps, 2) for i, b in boxes.items() if b and (b["contrast"] < MIN_CONTRAST or b["bg"] > 50)]
     worst = min((b["contrast"] for b in found), default=0)

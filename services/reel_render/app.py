@@ -246,12 +246,12 @@ def page_breaks(count: int, per_page: int) -> set[int]:
 
 
 def word_captions(text: str, start: float, end: float, per_page: int = 4) -> list[dict]:
-    """Spread a line's words across its scene, weighted by word length."""
+    """Spread a line's words across its whole scene, weighted by word length. No inset at the edges:
+    an inset left a caption gap of up to 0.3 s at every cut in reels without a voice."""
     words = text.split()
     if not words or end <= start:
         return []
-    inset = min(0.15, (end - start) * 0.05)
-    t0, t1 = start + inset, end - inset
+    t0, t1 = start, end
     weights = [len(w) + 2 for w in words]
     total = sum(weights)
     breaks = page_breaks(len(words), per_page)
