@@ -170,10 +170,8 @@ export const CaptionOverlay: React.FC<CaptionOverlayProps> = ({
         const fromFrame = Math.round((page.startMs / 1000) * fps);
         const lastEnd = holdLastPageUntilMs !== undefined ? Math.max(holdLastPageUntilMs, page.endMs + 500) : page.endMs + 500;
         const nextStart = pages[i + 1]?.startMs ?? lastEnd;
-        const duration = Math.max(
-          1,
-          Math.round(((nextStart - page.startMs) / 1000) * fps)
-        );
+        // End on the next page's first frame (rounding the length on its own left a 1-frame blank).
+        const duration = Math.max(1, Math.round((nextStart / 1000) * fps) - fromFrame);
 
         return (
           <Sequence key={i} from={fromFrame} durationInFrames={duration}>
