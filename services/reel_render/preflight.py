@@ -66,7 +66,8 @@ def stretch_of(frame: np.ndarray, source: Path) -> float | None:
         return None
     g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     h, w = g.shape
-    tpl = g[int(h * 0.12):int(h * 0.62), int(w * 0.15):int(w * 0.85)]  # above the captions, inside pans
+    # Below the AI tag (ends at about 18% of the height), above the captions, inside pans.
+    tpl = g[int(h * 0.20):int(h * 0.62), int(w * 0.15):int(w * 0.85)]
     best = (-1.0, None)
     for sx in (0.85, 0.92, 1.0, 1.08, 1.15):
         for zoom in (1.0, 1.06, 1.12, 1.18, 1.24):
