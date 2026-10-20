@@ -119,3 +119,41 @@ def test_main_stops_before_rendering_when_inputs_are_missing(tmp_path, capsys, m
     monkeypatch.setattr(rfs, "render_in_process", lambda *a: pytest.fail("rendered despite missing inputs"))
     assert rfs.main([str(scripts), str(tmp_path / "reels"), str(tmp_path / "out")]) == 2
     assert "jeepney: no folder" in capsys.readouterr().err
+
+
+# --- renderer caption paging and the preflight checks ------------------------------------------------
+import os  # noqa: E402
+
+import numpy as np  # noqa: E402
+
+os.environ.setdefault("RENDER_TOKEN", "test")
+import app as renderer  # noqa: E402
+import preflight  # noqa: E402
+
+
+@pytest.mark.parametrize("count, sizes", [(1, [1]), (4, [4]), (5, [3, 2]), (7, [4, 3]), (9, [3, 3, 3]), (13, [4, 3, 3, 3])])
+def test_caption_pages_are_balanced_and_never_one_word(count, sizes):
+    breaks = sorted(renderer.page_breaks(count, 4))
+    got = [b - a for a, b in zip([-1, *breaks], breaks)]
+    assert got == sizes
+    assert count == 1 or min(got) >= 2
+
+
+def _frame(v):
+    return np.full((480, 270, 3), v, np.uint8)
+
+
+def test_preflight_finds_cuts_and_dips():
+    frames = [_frame(120)] * 20 + [_frame(5)] * 2 + [_frame(200)] * 20
+    cuts = preflight.scene_cuts(frames)
+    assert cuts == [20]
+    lumas = [preflight._luma(f) for f in frames]
+    c = cuts[0]
+    assert min(lumas[c - 2:c + 3]) < preflight.DIP_RATIO * min(lumas[c - 4], lumas[c + 4])
+
+
+def test_preflight_straight_cut_is_not_a_dip():
+    frames = [_frame(120)] * 20 + [_frame(200)] * 20
+    c = preflight.scene_cuts(frames)[0]
+    lumas = [preflight._luma(f) for f in frames]
+    assert not min(lumas[c - 2:c + 3]) < preflight.DIP_RATIO * min(lumas[c - 4], lumas[c + 4])

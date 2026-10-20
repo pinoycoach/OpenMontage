@@ -346,22 +346,36 @@ const Vignette: React.FC = () => (
 // Enhanced Image Scene — spring physics, parallax, variety
 // ---------------------------------------------------------------------------
 
-const ImageScene: React.FC<{ src: string; animation?: string }> = ({
-  src,
-  animation,
-}) => {
+const ImageScene: React.FC<{
+  src: string;
+  animation?: string;
+  // Same meaning as on video cuts: "cut"/"none" = hard cut, "fade" = linear fade over transitionDuration.
+  // Unset keeps the default spring fade-in and the dim at the end.
+  transitionIn?: string;
+  transitionOut?: string;
+  transitionDuration?: number;
+}> = ({ src, animation, transitionIn, transitionOut, transitionDuration }) => {
   const frame = useCurrentFrame();
   const { fps, durationInFrames } = useVideoConfig();
+  const inMode = (transitionIn || "").toLowerCase();
+  const outMode = (transitionOut || "").toLowerCase();
+  const transitionFrames = Math.max(1, Math.round((transitionDuration ?? 8 / fps) * fps));
 
-  // Smooth spring fade-in
-  const fadeIn = spring({ frame, fps, config: { damping: 18, stiffness: 80 } });
+  // Smooth spring fade-in (default), a hard cut, or a linear fade
+  const fadeIn = ["cut", "none"].includes(inMode)
+    ? 1
+    : inMode === "fade"
+      ? interpolate(frame, [0, transitionFrames], [0, 1], { extrapolateLeft: "clamp", extrapolateRight: "clamp" })
+      : spring({ frame, fps, config: { damping: 18, stiffness: 80 } });
 
-  // Fade-out for crossfade effect
+  // Fade-out for crossfade effect (default), or none for a hard cut
   const fadeOutStart = durationInFrames - 8;
-  const fadeOut = interpolate(frame, [fadeOutStart, durationInFrames], [1, 0.3], {
-    extrapolateLeft: "clamp",
-    extrapolateRight: "clamp",
-  });
+  const fadeOut = ["cut", "none"].includes(outMode)
+    ? 1
+    : interpolate(frame, [fadeOutStart, durationInFrames], [1, 0.3], {
+        extrapolateLeft: "clamp",
+        extrapolateRight: "clamp",
+      });
 
   let scale = 1;
   let translateX = 0;
@@ -752,7 +766,15 @@ const SceneRenderer: React.FC<{ cut: Cut; theme: ThemeConfig }> = ({ cut, theme 
   const animation = cut.animation || cut.transform?.animation;
 
   if (cut.source && isImage(cut.source)) {
-    return maybeWrapWithBg(<ImageScene src={cut.source} animation={animation} />);
+    return maybeWrapWithBg(
+      <ImageScene
+        src={cut.source}
+        animation={animation}
+        transitionIn={cut.transition_in}
+        transitionOut={cut.transition_out}
+        transitionDuration={cut.transition_duration}
+      />,
+    );
   }
 
   if (cut.source && isVideo(cut.source)) {
@@ -844,6 +866,7 @@ export const Explainer: React.FC<ExplainerProps> = (props) => {
 
   // Resolve theme from props — playbook name, theme name, or custom themeConfig
   const theme = resolveTheme(props as Record<string, unknown>);
+  const lastOut = Math.max(0, ...cuts.map((c) => c.out_seconds || 0));
 
   return (
     <AbsoluteFill style={{ background: theme.backgroundColor, fontFamily: theme.headingFont || fontFamily }}>
@@ -854,7 +877,9 @@ export const Explainer: React.FC<ExplainerProps> = (props) => {
       {/* Layer 1: Visual scenes */}
       {cuts.map((cut) => {
         const from = Math.round(cut.in_seconds * fps);
-        const duration = Math.round((cut.out_seconds - cut.in_seconds) * fps);
+        let duration = Math.round((cut.out_seconds - cut.in_seconds) * fps);
+        // The scene that ends last runs to the end of the video, so rounding never leaves an empty frame.
+        if (cut.out_seconds >= lastOut) duration = Math.max(duration, durationInFrames - from);
 
         return (
           <Sequence key={cut.id} from={from} durationInFrames={duration}>
@@ -886,6 +911,7 @@ export const Explainer: React.FC<ExplainerProps> = (props) => {
       {captions && captions.length > 0 && (
         <CaptionOverlay
           words={captions}
+          holdLastPageUntilMs={props.holdLastCaption ? (durationInFrames / fps) * 1000 : undefined}
           wordsPerPage={(props.captionWordsPerPage as number) ?? 6}
           fontSize={(props.captionFontSize as number) ?? 42}
           bottomOffset={(props.captionBottomOffset as number) ?? 80}

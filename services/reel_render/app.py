@@ -97,6 +97,9 @@ MIME_EXT = {
     "audio/aac": ".aac",
     "audio/ogg": ".ogg",
     "audio/webm": ".webm",
+    "video/mp4": ".mp4",
+    "video/quicktime": ".mov",
+    "video/webm": ".webm",
 }
 DATA_URL_RE = re.compile(r"^data:([\w/+.-]+)(?:;[\w=.-]+)*;base64,(.*)$", re.DOTALL)
 
@@ -118,6 +121,12 @@ class EndCard(BaseModel):
 
 
 END_CARD_SECONDS = 2.5
+# Reels end on their last scene: no empty tail after it (the composer's default is 1 s of black).
+TAIL_SECONDS = 0.0
+# Without word timings, the last scene runs this long past its last caption word, so the line can be read.
+LAST_LINE_HOLD = 0.5
+# Straight cuts between scenes (no dip to black); only the first scene fades in, quickly.
+FIRST_FADE_IN = 0.3
 
 
 class Scene(BaseModel):
@@ -130,6 +139,9 @@ class Scene(BaseModel):
     card: Optional[Card] = None
     # What should move in a motion scene, e.g. "steam rises from the cup".
     motionPrompt: Optional[str] = Field(None, max_length=500)
+    # A ready-made clip for this scene (video data URL, e.g. an approved AI shot). It plays instead of
+    # the image; when it's shorter than the scene, its last frame is held so the frame never goes empty.
+    video: Optional[str] = None
 
 
 class RenderRequest(BaseModel):
@@ -357,6 +369,10 @@ def build_props(req: RenderRequest, image_paths: list[Path], voice_path: Optiona
             if exact_spans:
                 spans, exact = exact_spans, times
 
+    if not exact and spans and not req.endCard:  # an end card follows instead
+        start, end = spans[-1]
+        spans[-1] = (start, round(end + LAST_LINE_HOLD, 3))
+
     cuts, captions = [], []
     word_index = 0
     for i, (scene, path, (start, end)) in enumerate(zip(req.scenes, image_paths, spans)):
@@ -367,6 +383,9 @@ def build_props(req: RenderRequest, image_paths: list[Path], voice_path: Optiona
             "in_seconds": start,
             "out_seconds": end,
             "animation": MOTION_MAP.get(motion, motion),
+            "transition_in": "fade" if i == 0 else "cut",
+            "transition_out": "cut",
+            "transition_duration": FIRST_FADE_IN,
         }
         if scene.card:
             cut["type"] = "reel_card"
@@ -390,6 +409,9 @@ def build_props(req: RenderRequest, image_paths: list[Path], voice_path: Optiona
         "audio": {},
         # Every scene is a full-frame image, so skip the animated background (4x faster renders).
         "plainBackground": True,
+        # End on the last scene, with its caption still on screen.
+        "tailSeconds": TAIL_SECONDS,
+        "holdLastCaption": not req.endCard,
         # Big, short caption pages that sit above the Reels/TikTok UI on vertical video.
         "captionFontSize": 76 if vertical else 56,
         "captionWordsPerPage": per_page,
@@ -427,9 +449,9 @@ def mix_music(voice_path: Optional[Path], music_path: Path, total: float, job_di
     under the voice (a sidechain compressor lowers it whenever someone speaks)."""
     out = job_dir / "soundtrack.wav"
     fmt = "aformat=sample_rates=48000:channel_layouts=stereo"
-    fade_out = max(total - 2.0, 0.0)
+    fade_out = max(total - 1.0, 0.0)  # a 1 s fade that ends exactly with the video
     music_chain = (f"[1:a]{fmt},atrim=0:{total:.2f},volume={volume:.3f},"
-                   f"afade=t=in:d=1,afade=t=out:st={fade_out:.2f}:d=2")
+                   f"afade=t=in:d=1,afade=t=out:st={fade_out:.2f}:d=1")
     if voice_path:
         graph = (f"[0:a]{fmt},apad=whole_dur={total:.2f},asplit=2[voice][key];"
                  f"{music_chain}[music];"
@@ -720,6 +742,23 @@ def video_response(path: Path, filename: str, headers: Optional[dict] = None) ->
         **(headers or {})})
 
 
+def fit_clip(raw: bytes, ext: str, seconds: float, stem: Path) -> Path:
+    """Save a supplied scene clip; when it's shorter than the scene, hold its last frame to fill it."""
+    src = stem.with_suffix(ext or ".mp4")
+    src.write_bytes(raw)
+    have = probe_duration(src) or 0.0
+    if have >= seconds + 0.05:
+        return src
+    out = stem.parent / f"{stem.name}-fit.mp4"
+    pad = seconds - have + 0.1
+    proc = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(src), "-an", "-vf",
+                           f"tpad=stop_mode=clone:stop_duration={pad:.3f}", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                           str(out)], capture_output=True, text=True, timeout=180)
+    if proc.returncode != 0 or not out.exists():
+        raise HTTPException(400, f"That scene clip can't be read: {proc.stderr[-300:]}")
+    return out
+
+
 def render(props: dict, job_dir: Path, aspect: str) -> Path:
     width, height = (1080, 1920) if aspect == "9:16" else (1920, 1080)
     props_path = job_dir / "props.json"
@@ -775,6 +814,12 @@ def render_reel(req: RenderRequest, background: BackgroundTasks) -> StreamingRes
 
         heard = transcribe(voice_path) if voice_path else None
         props = build_props(req, image_paths, voice_path, voice_seconds, heard)
+        for i, scene in enumerate(req.scenes):
+            if scene.video:
+                raw, ext = decode_data_url(scene.video, "video/")
+                cut = props["cuts"][i]
+                clip = fit_clip(raw, ext, cut["out_seconds"] - cut["in_seconds"], job_dir / f"clip-{i + 1}")
+                cut["source"] = clip.name
         # Taken before fal is called, so a request that is turned away has paid for nothing.
         if not _render_lock.acquire(timeout=LOCK_WAIT_SECONDS):
             raise HTTPException(429, "Another reel is rendering. Try again in a minute.")
@@ -786,14 +831,13 @@ def render_reel(req: RenderRequest, background: BackgroundTasks) -> StreamingRes
                 motion_job = pool.submit(add_motion_scenes, props, req, job_dir, image_paths, failures=fal_failures)
                 talked, moved = talking_job.result(), motion_job.result()
             if music_path:
-                # Explainer adds a one-second fade after the last scene.
-                total = max(c["out_seconds"] for c in props["cuts"]) + 1.0
+                total = max(c["out_seconds"] for c in props["cuts"]) + TAIL_SECONDS
                 soundtrack = mix_music(voice_path, music_path, total, job_dir, req.musicVolume)
                 props["audio"]["narration"] = {"src": soundtrack.name, "volume": 1}
             if req.sfx:
                 narration = props["audio"].get("narration")
                 base = job_dir / narration["src"] if narration else None
-                total = max(c["out_seconds"] for c in props["cuts"]) + 1.0
+                total = max(c["out_seconds"] for c in props["cuts"]) + TAIL_SECONDS
                 try:
                     mixed = mix_sfx(base, sfx_events(props), total, job_dir)
                     props["audio"]["narration"] = {"src": mixed.name, "volume": 1}

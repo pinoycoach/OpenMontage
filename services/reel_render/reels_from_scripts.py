@@ -16,7 +16,8 @@ just a label), then that reel's script (60 words or less):
     The Philippines has 7,641 islands. ...
 
 reels/<slug>/ holds that reel's images (shown in file-name order), its credits.txt (source and licence
-of every image; required) and, optionally, voice.mp3 (the narration of exactly that script). Without a
+of every image; required), optionally an approved motion clip per image (03.mp4 plays instead of
+03.jpg) and, optionally, voice.mp3 (the narration of exactly that script). Without a
 voice the reel is captions only. The music file needs a licence file next to it (<name>.txt, LICENSE or
 credits.txt). Out: <slug>.mp4 for every reel, credits.txt and report.txt (time and cost per reel).
 """
@@ -38,14 +39,11 @@ from pathlib import Path
 MAX_WORDS = 60
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 VOICE_NAMES = ("voice.mp3", "voice.m4a", "voice.wav")
+CLIP_EXTS = (".mp4", ".mov", ".webm")
 # Slow pan and zoom on every still, alternating so cuts don't feel repetitive.
 MOTIONS = ["zoom-in", "pan-left", "zoom-out", "pan-right"]
 LONG_EDGE = 1920
 TARGET_LUFS = -14.0
-# The renderer's composition fades to black for 1 s after the last scene, and each scene dims over its
-# last 8 frames; the finished reel cuts both and holds the last bright frame (photo + last caption).
-END_FADE_SECONDS = 1.0 + 0.3
-END_HOLD_SECONDS = 0.5
 SILENT_LUFS = -50.0
 AI_LABEL = "AI-generated"
 FONT_CANDIDATES = [
@@ -142,6 +140,14 @@ def reel_images(folder: Path) -> list[Path]:
     return sorted(p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS)
 
 
+def scene_clip(image: Path) -> Path | None:
+    """An approved motion clip for this image: same name, video extension (03.jpg -> 03.mp4)."""
+    for ext in CLIP_EXTS:
+        if image.with_suffix(ext).is_file():
+            return image.with_suffix(ext)
+    return None
+
+
 def reel_voice(folder: Path) -> Path | None:
     for name in VOICE_NAMES:
         if (folder / name).is_file():
@@ -207,6 +213,9 @@ def build_request(script: str, images: list[Path], voice: Path | None, music: Pa
             "captionOverlay": None if voice else piece,
             "cameraMotion": MOTIONS[i % len(MOTIONS)],
         })
+        clip = scene_clip(image)
+        if clip:
+            scenes[-1]["video"] = data_url(clip)
     body = {"scenes": scenes, "aspectRatio": "9:16", "captions": True, "captionStyle": "yellow-pop",
             "sfx": False}
     if voice:
@@ -243,8 +252,8 @@ def loudness(path: Path) -> float | None:
 
 
 def finish(raw: Path, out: Path, ai_label: bool) -> None:
-    """The final file: ends on the last photo (the composer's fade to black is cut, so the last line
-    never sits alone on black), the AI label burned in top left (when asked), audio at -14 LUFS."""
+    """The final file: the AI label burned in top left (when asked) and the audio at -14 LUFS. The
+    renderer already ends on the last photo with its caption, and fades the music out with the video."""
     vf = []
     if ai_label:
         font = find_font()
@@ -255,12 +264,6 @@ def finish(raw: Path, out: Path, ai_label: bool) -> None:
     af = []
     if lufs is not None and lufs > SILENT_LUFS:  # never boost a silent (captions-only) track
         af = [f"volume={TARGET_LUFS - lufs:.2f}dB", "alimiter=limit=0.84:level=false"]
-    total = probe_seconds(raw) or 0.0
-    keep = max(total - END_FADE_SECONDS, 1.0) if total else None
-    if keep:
-        vf.insert(0, f"trim=duration={keep:.3f},tpad=stop_mode=clone:stop_duration={END_HOLD_SECONDS}")
-        af.append(f"atrim=duration={keep + END_HOLD_SECONDS:.3f}")
-        af.append(f"afade=t=out:st={max(keep + END_HOLD_SECONDS - 0.4, 0):.2f}:d=0.4")  # no click at the end
     cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(raw)]
     if vf:
         cmd += ["-vf", ",".join(vf)]
@@ -344,11 +347,15 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     args.out.mkdir(parents=True, exist_ok=True)
-    report, credits = [], []
+    report, credits, labelled = [], [], []
+    preflight_fails = 0
     t_all = time.monotonic()
     for slug, script in reels:
         folder = args.reels / slug
         images, voice = reel_images(folder), reel_voice(folder)
+        clips = {i: c for i, image in enumerate(images) if (c := scene_clip(image))}
+        # AI motion clips (or an AI voice, by --ai-label) put the "AI-generated" tag on screen.
+        ai_label = args.ai_label or bool(clips)
         t0 = time.monotonic()
         print(f"[{slug}] {len(images)} images, {len(script.split())} words, "
               f"{'voice ' + voice.name if voice else 'no voice (captions only)'}")
@@ -359,7 +366,7 @@ def main(argv: list[str] | None = None) -> int:
                 raw = work / "raw.mp4"
                 render_in_process(body, raw)
                 final = args.out / f"{slug}.mp4"
-                finish(raw, final, args.ai_label)
+                finish(raw, final, ai_label)
             except (ReelError, subprocess.CalledProcessError) as exc:
                 print(f"[{slug}] failed: {exc}", file=sys.stderr)
                 report.append(f"{slug}: FAILED after {time.monotonic() - t0:.0f} s: {exc}")
@@ -367,22 +374,35 @@ def main(argv: list[str] | None = None) -> int:
         info = probe(final)
         video = next((s for s in info.get("streams", []) if s.get("codec_type") == "video"), {})
         seconds = time.monotonic() - t0
+        from preflight import check_reel  # noqa: E402 - beside this file; needs OpenCV like the renderer
+        checks = check_reel(final, images, clips, (folder / "credits.txt").read_text(encoding="utf-8"),
+                            has_voice=bool(voice), has_music=bool(music_by_reel[slug]),
+                            sheet=args.out / f"{slug}-sheet-2fps.jpg")
+        fails = [c for c in checks if c.status == "FAIL"]
+        preflight_fails += len(fails)
+        (args.out / f"{slug}-preflight.txt").write_text(
+            f"{slug}: {'PASS' if not fails else f'{len(fails)} FAIL'}\n" + "\n".join(c.line() for c in checks) + "\n",
+            encoding="utf-8")
+        if ai_label:
+            labelled.append(slug)
         report.append(f"{slug}: {final.name}, {video.get('width')}x{video.get('height')} "
                       f"{video.get('r_frame_rate')}, {float(info.get('format', {}).get('duration', 0)):.1f} s video, "
-                      f"made in {seconds:.0f} s, paid calls $0.00, loudness {loudness(final)} LUFS")
+                      f"made in {seconds:.0f} s, paid calls in this run $0.00, loudness {loudness(final)} LUFS, "
+                      f"preflight {'PASS' if not fails else f'{len(fails)} FAIL'}")
         credits += [f"== {slug} ==", (folder / "credits.txt").read_text(encoding="utf-8").strip(), ""]
         if music_by_reel[slug]:
             credits += [f"Music for {slug}: {music_by_reel[slug].name}", ""]
         print(f"[{slug}] done in {seconds:.0f} s -> {final}")
     for music, licence in licences.items():
         credits += ["== music ==", f"{music.name}", licence.read_text(encoding="utf-8").strip(), ""]
-    if args.ai_label:
-        credits += ["== label ==", f'"{AI_LABEL}" is shown on screen (AI voice or AI visuals).', ""]
+    if labelled:
+        credits += ["== label ==", f'"{AI_LABEL}" is shown on screen in: {", ".join(labelled)} '
+                    "(AI voice or AI motion). Add Meta's AI label when posting.", ""]
     (args.out / "credits.txt").write_text("\n".join(credits), encoding="utf-8")
     report.append(f"total: {time.monotonic() - t_all:.0f} s for {len(reels)} reels")
     (args.out / "report.txt").write_text("\n".join(report) + "\n", encoding="utf-8")
     print("\n".join(report))
-    return 0 if not any("FAILED" in r for r in report) else 1
+    return 0 if not any("FAILED" in r for r in report) and not preflight_fails else 1
 
 
 if __name__ == "__main__":

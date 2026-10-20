@@ -32,6 +32,8 @@ type CaptionOverlayProps = {
   wordSeparator?: string;
   // Distance from the bottom edge in px. Vertical reels want captions above the app UI.
   bottomOffset?: number;
+  /** Keep the last page on screen until this time (ms), e.g. the end of the video. */
+  holdLastPageUntilMs?: number;
 };
 
 interface CaptionPage {
@@ -151,6 +153,7 @@ export const CaptionOverlay: React.FC<CaptionOverlayProps> = ({
   fontFamily = "Space Grotesk, Inter, system-ui, sans-serif",
   wordSeparator = " ",
   bottomOffset = 80,
+  holdLastPageUntilMs,
 }) => {
   const { fps } = useVideoConfig();
   const pages = buildPages(words, wordsPerPage);
@@ -159,7 +162,8 @@ export const CaptionOverlay: React.FC<CaptionOverlayProps> = ({
     <AbsoluteFill>
       {pages.map((page, i) => {
         const fromFrame = Math.round((page.startMs / 1000) * fps);
-        const nextStart = pages[i + 1]?.startMs ?? page.endMs + 500;
+        const lastEnd = holdLastPageUntilMs !== undefined ? Math.max(holdLastPageUntilMs, page.endMs + 500) : page.endMs + 500;
+        const nextStart = pages[i + 1]?.startMs ?? lastEnd;
         const duration = Math.max(
           1,
           Math.round(((nextStart - page.startMs) / 1000) * fps)
