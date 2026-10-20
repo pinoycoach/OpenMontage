@@ -4,6 +4,10 @@ Start here. This is the complete operating guide and agent contract for OpenMont
 
 For architecture, key files, and conventions see [`PROJECT_CONTEXT.md`](PROJECT_CONTEXT.md).
 
+## Renderer Service (`services/reel_render/`)
+
+Changes to the Cloud Run renderer in `services/reel_render/` are service code, not a video production task: skip onboarding and the pipeline flow (Rule Zero) for them, and follow `CLAUDE.md` → "Decisions (this repo)" (deploys, streaming, checks before a PR).
+
 ## First Interaction — Onboarding
 
 When the user's first message is vague, exploratory, or asks what you can do ("make me a video", "what can you do?", "help me create something", "I want to make content"), read the onboarding skill **before** doing anything else:

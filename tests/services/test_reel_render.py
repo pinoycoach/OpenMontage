@@ -6,6 +6,10 @@ The actual Remotion render is stubbed out; these tests never launch Chrome.
 from __future__ import annotations
 
 import base64
+import io
+import json
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -274,13 +278,8 @@ class TestTalkingScenes:
                 return {"status": next(statuses)}
             return {"video": {"url": "https://cdn/clip.mp4"}}
 
-        class FakeResp:
-            def __enter__(self): return self
-            def __exit__(self, *a): return False
-            def read(self): return b"clip-bytes"
-
         monkeypatch.setattr(rr, "_fal_json", fake_json)
-        monkeypatch.setattr(rr.urllib.request, "urlopen", lambda url, timeout=0: FakeResp())
+        monkeypatch.setattr(rr.urllib.request, "urlopen", lambda url, timeout=0: io.BytesIO(b"clip-bytes"))
         monkeypatch.setattr(rr, "_fal_file_url", lambda path, mime: f"https://cdn/{path.name}")
         out = rr.talking_clip(face, voice, 1.0, 3.0, tmp_path / "talk-1.mp4", rr.time.monotonic() + 60)
         assert out.read_bytes() == b"clip-bytes"
@@ -290,7 +289,7 @@ class TestTalkingScenes:
     def test_endpoint_reports_talking_header(self, monkeypatch, tmp_path: Path):
         monkeypatch.setattr(rr, "RENDER_TOKEN", "secret")
         monkeypatch.setattr(rr, "transcribe", lambda p: None)
-        monkeypatch.setattr(rr, "add_talking_scenes", lambda props, req, job_dir, voice: 1)
+        monkeypatch.setattr(rr, "add_talking_scenes", lambda props, req, job_dir, voice, failures=None: 1)
 
         def fake_render(props, job_dir, aspect):
             out = job_dir / "reel.mp4"
@@ -438,7 +437,7 @@ class TestCardsAndMotion:
 
     def test_endpoint_reports_motion_header(self, monkeypatch):
         monkeypatch.setattr(rr, "RENDER_TOKEN", "secret")
-        monkeypatch.setattr(rr, "add_motion_scenes", lambda props, req, job_dir, paths: 1)
+        monkeypatch.setattr(rr, "add_motion_scenes", lambda props, req, job_dir, paths, failures=None: 1)
 
         def fake_render(props, job_dir, aspect):
             out = job_dir / "reel.mp4"
@@ -702,3 +701,183 @@ class TestDub:
         assert 110 <= segs[0]["pitch"] <= 130
         assert 205 <= segs[1]["pitch"] <= 235
         assert segs[2]["pitch"] is None
+
+
+class TestSafety:
+    """Token on every route, lock before fal, fal spend log and cap, the source cache, stream size."""
+
+    def _render_stub(self, monkeypatch):
+        def fake_render(props, job_dir, aspect):
+            out = job_dir / "reel.mp4"
+            out.write_bytes(b"fake-mp4")
+            return out
+        monkeypatch.setattr(rr, "render", fake_render)
+
+    def test_every_post_route_needs_the_token_even_with_a_bad_body(self, monkeypatch):
+        monkeypatch.setattr(rr, "RENDER_TOKEN", "secret")
+        c = TestClient(rr.app)
+        posts = sorted(r.path for r in rr.app.routes if "POST" in getattr(r, "methods", ()))
+        assert {"/render", "/clips/transcribe", "/clips/render", "/dub/transcribe", "/dub/render"} <= set(posts)
+        for path in posts:
+            assert c.post(path, json={}).status_code == 401, path
+            assert c.post(path, json={}, headers={"Authorization": "Bearer nope"}).status_code == 401, path
+        assert c.get("/health").status_code == 200 and c.get("/healthz").status_code == 200
+
+    def test_busy_render_is_refused_before_fal_is_called(self, monkeypatch):
+        monkeypatch.setattr(rr, "RENDER_TOKEN", "secret")
+        monkeypatch.setattr(rr, "FAL_KEY", "k")
+        monkeypatch.setattr(rr, "LOCK_WAIT_SECONDS", 0.01)
+        monkeypatch.setattr(rr, "transcribe", lambda p: None)
+        calls = []
+        monkeypatch.setattr(rr, "_fal_run", lambda *a, **k: calls.append(a))
+        monkeypatch.setattr(rr, "_fal_json", lambda *a, **k: calls.append(a))
+        monkeypatch.setattr(rr, "_fal_file_url", lambda *a, **k: calls.append(a))
+        # The only ways /render reaches fal.
+        monkeypatch.setattr(rr, "add_talking_scenes", lambda *a, **k: calls.append(a) or 0)
+        monkeypatch.setattr(rr, "add_motion_scenes", lambda *a, **k: calls.append(a) or 0)
+        body = {"scenes": [{"image": PNG_URL, "durationSeconds": 2}, {"image": PNG_URL, "durationSeconds": 2}],
+                "voiceover": WAV_URL, "talkingImage": PNG_URL, "talkingScenes": [0], "motionScenes": [1]}
+        assert rr._render_lock.acquire(timeout=1)
+        try:
+            res = TestClient(rr.app).post("/render", json=body, headers={"Authorization": "Bearer secret"})
+        finally:
+            rr._render_lock.release()
+        assert res.status_code == 429
+        assert calls == []
+
+    def test_fal_failures_and_expected_bytes_headers(self, monkeypatch, tmp_path: Path):
+        monkeypatch.setattr(rr, "RENDER_TOKEN", "secret")
+        self._render_stub(monkeypatch)
+
+        def failing_talk(props, req, job_dir, voice, failures=None):
+            failures.append("talking scene 1")
+            return 0
+
+        monkeypatch.setattr(rr, "add_talking_scenes", failing_talk)
+        body = {"scenes": [{"image": PNG_URL, "durationSeconds": 2}], "talkingImage": PNG_URL, "talkingScenes": [0]}
+        res = TestClient(rr.app).post("/render", json=body, headers={"Authorization": "Bearer secret"})
+        assert res.status_code == 200
+        assert res.headers["x-fal-failures"] == "1" and res.headers["x-talking-scenes"] == "0/1"
+        # Still streamed (no Content-Length), but the client can check it got the whole file.
+        assert "content-length" not in res.headers
+        assert res.headers["x-expected-bytes"] == str(len(b"fake-mp4")) == str(len(res.content))
+
+    def test_fal_job_log_line(self, monkeypatch, tmp_path: Path, capsys):
+        import subprocess
+        monkeypatch.setattr(rr, "FAL_KEY", "fal-secret-key")
+        monkeypatch.setattr(rr, "_fal_spend", {"day": "", "usd": 0.0})
+        voice = tmp_path / "voice.wav"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "sine=duration=4", str(voice)],
+                       check=True)
+        face = tmp_path / "face.jpg"
+        face.write_bytes(PNG_1PX)
+        monkeypatch.setattr(rr, "_fal_file_url", lambda path, mime: f"https://cdn/{path.name}")
+        monkeypatch.setattr(rr, "_fal_run", lambda model, body, deadline, tag: {"video": {"url": "https://cdn/v.mp4"}})
+        monkeypatch.setattr(rr, "_download", lambda url, out: (out.write_bytes(b"mp4"), out)[1])
+        rr.talking_clip(face, voice, 1.0, 3.0, tmp_path / "talk-1.mp4", time.monotonic() + 60)
+
+        def boom(model, body, deadline, tag):
+            raise RuntimeError("fal HTTP 403: out of credit")
+        monkeypatch.setattr(rr, "_fal_run", boom)
+        with pytest.raises(RuntimeError):
+            rr.talking_clip(face, voice, 0.0, 1.0, tmp_path / "talk-2.mp4", time.monotonic() + 60)
+
+        out = capsys.readouterr().out
+        logs = [json.loads(line) for line in out.splitlines() if line.startswith("{")]
+        assert [(l["event"], l["status"]) for l in logs] == [("fal_job", "ok"), ("fal_job", "failed")]
+        assert logs[0]["model"] == rr.FAL_TALKING_MODEL and logs[0]["seconds"] == 2.0
+        assert logs[0]["estimateUsd"] == pytest.approx(0.04) and logs[0]["severity"] == "INFO"
+        assert "out of credit" in logs[1]["error"] and logs[1]["dayTotalUsd"] == pytest.approx(0.06)
+        assert "fal-secret-key" not in out
+
+    def test_daily_cap_refuses_past_the_cap(self, monkeypatch, capsys):
+        monkeypatch.setattr(rr, "FAL_DAILY_CAP_USD", 0.10)
+        monkeypatch.setattr(rr, "_fal_spend", {"day": "", "usd": 0.0})
+        sent = []
+        monkeypatch.setattr(rr, "_fal_run", lambda model, body, deadline, tag: sent.append(model) or {"ok": 1})
+        for _ in range(2):  # 2 s of FlashTalk is about $0.04
+            rr._fal_paid("talking", "fal-ai/flashtalk", {}, time.monotonic() + 60, 2.0)
+        with pytest.raises(RuntimeError, match="cap"):
+            rr._fal_paid("talking", "fal-ai/flashtalk", {}, time.monotonic() + 60, 2.0)
+        assert len(sent) == 2  # the third job never reached fal
+        logs = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
+        assert logs[-1]["status"] == "cap" and logs[-1]["capUsd"] == 0.10
+        # A new Manila day starts from zero.
+        monkeypatch.setattr(rr, "_fal_spend", {"day": "2000-01-01", "usd": 99.0})
+        rr._fal_paid("talking", "fal-ai/flashtalk", {}, time.monotonic() + 60, 2.0)
+        assert len(sent) == 3
+
+    def test_estimates_follow_the_model(self):
+        assert rr.fal_estimate("motion", "fal-ai/kling-video/v2.5-turbo/standard/image-to-video", 5) == 0.21
+        assert rr.fal_estimate("motion", "some/new-model", 5) == 0.7  # unknown: the kind's fallback rate
+        assert rr.fal_estimate("stems", rr.FAL_STEMS_MODEL, 900) == rr.FAL_STEMS_USD
+
+    def test_fal_result_download_is_capped(self, monkeypatch, tmp_path: Path):
+        monkeypatch.setattr(rr, "MAX_FAL_RESULT_BYTES", 10)
+        monkeypatch.setattr(rr.urllib.request, "urlopen", lambda url, timeout=0: io.BytesIO(b"x" * 20))
+        with pytest.raises(RuntimeError, match="over"):
+            rr._download("https://cdn/big.mp4", tmp_path / "big.mp4")
+
+
+class TestSourceCache:
+    NEW = "N" * 25
+
+    def _drive(self, monkeypatch, body: bytes):
+        class DriveResp(io.BytesIO):
+            headers = {"Content-Type": "video/mp4", "Content-Length": str(len(body))}
+        monkeypatch.setattr(rr.urllib.request, "urlopen", lambda url, timeout=0: DriveResp(body))
+
+    def _cached(self, cache: Path, name: str, size: int, age: float) -> Path:
+        f = cache / f"{name}.video"
+        f.write_bytes(b"v" * size)
+        then = time.time() - age
+        os.utime(f, (then, then))
+        return f
+
+    @pytest.fixture
+    def cache(self, monkeypatch, tmp_path: Path) -> Path:
+        monkeypatch.setattr(rr, "CLIP_CACHE", tmp_path)
+        monkeypatch.setattr(rr, "CLIP_CACHE_MAX_BYTES", 10_000)
+        monkeypatch.setattr(rr, "probe_duration", lambda p: 60.0)
+        return tmp_path
+
+    def test_drops_oldest_sources_but_keeps_ones_in_use(self, cache: Path, monkeypatch):
+        import threading
+        locked = self._cached(cache, "A" * 25, 4000, 3000)   # oldest, but another request holds its lock
+        old = self._cached(cache, "B" * 25, 4000, 2000)      # oldest free one: dropped
+        spare = self._cached(cache, "C" * 25, 2000, 1000)    # not needed to make room
+        recent = self._cached(cache, "D" * 25, 1000, 10)     # handed out a moment ago
+        lock = threading.Lock()
+        lock.acquire()
+        monkeypatch.setitem(rr._source_locks, locked.stem, lock)
+        self._drive(monkeypatch, b"n" * 3000)
+        path = rr.source_video(f"https://drive.google.com/file/d/{self.NEW}/view")
+        assert path.read_bytes() == b"n" * 3000
+        assert not old.exists()
+        assert locked.exists() and spare.exists() and recent.exists()
+        assert sum(f.stat().st_size for f in cache.iterdir()) <= rr.CLIP_CACHE_MAX_BYTES
+
+    def test_refuses_when_everything_is_in_use(self, cache: Path, monkeypatch):
+        busy = self._cached(cache, "D" * 25, 9000, 10)
+        self._drive(monkeypatch, b"n" * 3000)
+        with pytest.raises(HTTPException) as exc:
+            rr.source_video(f"https://drive.google.com/file/d/{self.NEW}/view")
+        assert exc.value.status_code == 429
+        assert busy.exists() and sorted(f.name for f in cache.iterdir()) == [busy.name]
+
+    def test_too_long_source_is_not_cached(self, cache: Path, monkeypatch):
+        monkeypatch.setattr(rr, "probe_duration", lambda p: 100 * 60.0)
+        self._drive(monkeypatch, b"n" * 3000)
+        with pytest.raises(HTTPException) as exc:
+            rr.source_video(f"https://drive.google.com/file/d/{self.NEW}/view")
+        assert exc.value.status_code == 400 and "minutes" in exc.value.detail
+        assert list(cache.iterdir()) == []
+        assert rr._cache_reserved == {}
+
+    def test_download_deadline(self, cache: Path, monkeypatch):
+        monkeypatch.setattr(rr, "DRIVE_DOWNLOAD_DEADLINE_S", -1)
+        self._drive(monkeypatch, b"n" * 3000)
+        with pytest.raises(HTTPException) as exc:
+            rr.source_video(f"https://drive.google.com/file/d/{self.NEW}/view")
+        assert exc.value.status_code == 504
+        assert list(cache.iterdir()) == []

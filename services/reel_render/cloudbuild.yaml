@@ -1,18 +1,34 @@
-# Builds the reel render image with Cloud Build. Run from the repo root:
-#   gcloud builds submit --config services/reel_render/cloudbuild.yaml --substitutions=_REGION=asia-southeast1 .
+# Tests, then builds the reel render image with Cloud Build. Run by the GitHub push trigger, or by hand
+# from the repo root (SHORT_SHA is only set for trigger builds, so pass it yourself):
+#   gcloud builds submit --config services/reel_render/cloudbuild.yaml \
+#     --substitutions=_REGION=asia-southeast1,SHORT_SHA=$(git rev-parse --short HEAD) .
 # With _SERVICE set (e.g. by a GitHub push trigger: _SERVICE=openmontage-render) it also deploys the
 # new image to that Cloud Run service, keeping the service's settings, secrets and environment.
 steps:
+  # The renderer tests must pass before an image is built. Same Debian (bookworm, so the same ffmpeg)
+  # and Python as the image; the tests mock fal and never open a network connection.
+  - name: python:3.11-slim-bookworm
+    id: test
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -e
+        apt-get update -qq && apt-get install -y -qq --no-install-recommends ffmpeg > /dev/null
+        pip install --no-cache-dir -q -r services/reel_render/requirements.txt pytest==9.1.1 httpx==0.28.1
+        python -m pytest -q tests/services/test_reel_render.py
   - name: gcr.io/cloud-builders/docker
     args:
       - build
       - -f
       - services/reel_render/Dockerfile
       - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/openmontage/reel-render:$SHORT_SHA
+      - -t
       - ${_REGION}-docker.pkg.dev/$PROJECT_ID/openmontage/reel-render:latest
       - .
   - name: gcr.io/cloud-builders/docker
-    args: [push, "${_REGION}-docker.pkg.dev/$PROJECT_ID/openmontage/reel-render:latest"]
+    args: [push, --all-tags, "${_REGION}-docker.pkg.dev/$PROJECT_ID/openmontage/reel-render"]
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
     entrypoint: bash
     args:
@@ -20,8 +36,9 @@ steps:
       - |
         if [ -z "${_SERVICE}" ]; then echo "No _SERVICE set; image built, not deployed."; exit 0; fi
         gcloud run deploy "${_SERVICE}" --region "${_REGION}" --quiet \
-          --image "${_REGION}-docker.pkg.dev/$PROJECT_ID/openmontage/reel-render:latest"
+          --image "${_REGION}-docker.pkg.dev/$PROJECT_ID/openmontage/reel-render:$SHORT_SHA"
 images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/openmontage/reel-render:$SHORT_SHA
   - ${_REGION}-docker.pkg.dev/$PROJECT_ID/openmontage/reel-render:latest
 substitutions:
   _REGION: asia-southeast1

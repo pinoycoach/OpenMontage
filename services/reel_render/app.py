@@ -32,11 +32,12 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Literal, Optional
 
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -56,6 +57,21 @@ MAX_TALKING_SCENES = 3
 FAL_MOTION_MODEL = os.environ.get("FAL_MOTION_MODEL", "fal-ai/kling-video/v3/standard/image-to-video")
 MOTION_TIMEOUT_SECONDS = int(os.environ.get("MOTION_TIMEOUT_SECONDS", "420"))
 MAX_MOTION_SCENES = 2
+# Rough fal prices in USD per second of clip, for the log line and the daily cap only (estimate;
+# the fal dashboard has the real charge). A model not listed counts at its kind's fallback rate.
+FAL_USD_PER_SECOND = {
+    "fal-ai/flashtalk": 0.02,
+    "fal-ai/kling-video/v3/standard/image-to-video": 0.14,
+    "fal-ai/kling-video/v2.5-turbo/standard/image-to-video": 0.042,
+}
+FAL_FALLBACK_USD_PER_SECOND = {"talking": 0.02, "motion": 0.14}
+# Estimate: one Demucs job, flat (a full 15-minute episode at about $0.0007 per second).
+FAL_STEMS_USD = 0.65
+# Optional spend brake: past this many estimated USD per day (Manila time) fal is not called and
+# the scene or background falls back as if fal had failed. Unset means no cap.
+FAL_DAILY_CAP_USD = float(os.environ["FAL_DAILY_CAP_USD"]) if os.environ.get("FAL_DAILY_CAP_USD") else None
+MANILA = timezone(timedelta(hours=8))  # Asia/Manila is UTC+8 all year (no daylight saving)
+MAX_FAL_RESULT_BYTES = 500 * 1024 * 1024
 MAX_SCENES = 30
 MAX_ASSET_BYTES = 25 * 1024 * 1024
 FPS = 30
@@ -137,17 +153,25 @@ class RenderRequest(BaseModel):
     sfx: bool = False
 
 
-app = FastAPI(title="OpenMontage reel render")
-# One render per instance: Remotion already uses every core it is given.
-_render_lock = threading.Lock()
+OPEN_PATHS = {"/health", "/healthz"}
 
 
-def _check_token(authorization: Optional[str]) -> None:
+def _check_token(request: Request, authorization: Optional[str] = Header(None)) -> None:
+    """Every route needs the token except the health check. It runs as an app-wide dependency, so a
+    new route is covered without remembering to call it."""
+    if request.url.path in OPEN_PATHS:
+        return
     if not RENDER_TOKEN:
         raise HTTPException(503, "RENDER_TOKEN is not configured on the render service.")
     given = (authorization or "").removeprefix("Bearer ").strip()
     if not hmac.compare_digest(given.encode(), RENDER_TOKEN.encode()):
         raise HTTPException(401, "Bad render token.")
+
+
+app = FastAPI(title="OpenMontage reel render", dependencies=[Depends(_check_token)])
+# One render per instance: Remotion already uses every core it is given.
+_render_lock = threading.Lock()
+LOCK_WAIT_SECONDS = 5
 
 
 def decode_data_url(data_url: str, allowed_prefix: str) -> tuple[bytes, str]:
@@ -498,9 +522,56 @@ def _fal_run(model: str, body: dict, deadline: float, tag: str) -> dict:
         time.sleep(3)
 
 
+_fal_spend = {"day": "", "usd": 0.0}
+_fal_spend_lock = threading.Lock()
+
+
+def fal_estimate(tag: str, model: str, seconds: float) -> float:
+    if tag == "stems":
+        return FAL_STEMS_USD
+    rate = FAL_USD_PER_SECOND.get(model, FAL_FALLBACK_USD_PER_SECOND[tag])
+    return round(rate * seconds, 4)
+
+
+def _fal_log(severity: str, **fields) -> None:
+    # One JSON line per fal job; Cloud Run's logging reads it as a structured entry.
+    print(json.dumps({"severity": severity, "event": "fal_job", **fields}), flush=True)
+
+
+def _fal_paid(tag: str, model: str, body: dict, deadline: float, seconds: float) -> dict:
+    """_fal_run with the daily cap and a log line. A refused job raises like a failed one, so the
+    caller falls back the same way."""
+    estimate = fal_estimate(tag, model, seconds)
+    line = {"tag": tag, "model": model, "seconds": round(seconds, 2), "estimateUsd": estimate}
+    with _fal_spend_lock:
+        today = datetime.now(MANILA).date().isoformat()
+        if _fal_spend["day"] != today:
+            _fal_spend.update(day=today, usd=0.0)
+        if FAL_DAILY_CAP_USD is not None and _fal_spend["usd"] + estimate > FAL_DAILY_CAP_USD:
+            _fal_log("WARNING", **line, status="cap", dayTotalUsd=round(_fal_spend["usd"], 4),
+                     capUsd=FAL_DAILY_CAP_USD)
+            raise RuntimeError(f"daily fal cap of ${FAL_DAILY_CAP_USD:g} reached")
+        # Counted when sent: a job that fails or is cancelled may still be billed.
+        _fal_spend["usd"] += estimate
+        day_total = round(_fal_spend["usd"], 4)
+    try:
+        result = _fal_run(model, body, deadline, tag)
+    except Exception as exc:
+        _fal_log("WARNING", **line, status="failed", dayTotalUsd=day_total, error=str(exc)[:300])
+        raise
+    _fal_log("INFO", **line, status="ok", dayTotalUsd=day_total)
+    return result
+
+
 def _download(url: str, out: Path) -> Path:
-    with urllib.request.urlopen(url, timeout=120) as resp:
-        out.write_bytes(resp.read())
+    """Save a fal result, refusing anything over MAX_FAL_RESULT_BYTES (it lands in memory on Cloud Run)."""
+    size = 0
+    with urllib.request.urlopen(url, timeout=120) as resp, out.open("wb") as f:
+        while chunk := resp.read(1024 * 1024):
+            size += len(chunk)
+            if size > MAX_FAL_RESULT_BYTES:
+                raise RuntimeError(f"fal result is over {MAX_FAL_RESULT_BYTES // (1024 * 1024)} MB")
+            f.write(chunk)
     return out
 
 
@@ -511,10 +582,10 @@ def talking_clip(face: Path, voice: Path, start: float, end: float, out: Path, d
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{start:.3f}", "-to", f"{end:.3f}",
                     "-i", str(voice), "-ac", "1", "-b:a", "64k", str(segment)],
                    check=True, capture_output=True, timeout=60)
-    result = _fal_run(FAL_TALKING_MODEL, {
+    result = _fal_paid("talking", FAL_TALKING_MODEL, {
         "image_url": _fal_file_url(face, "image/jpeg"),
         "audio_url": _fal_file_url(segment, "audio/mpeg"),
-    }, deadline, "talking")
+    }, deadline, end - start)
     return _download(result["video"]["url"], out)
 
 
@@ -529,13 +600,13 @@ def motion_clip(image: Path, prompt: Optional[str], seconds: float, out: Path, d
                     "-vf", "scale='min(1080,iw)':-2", "-q:v", "3", str(still)],
                    check=True, capture_output=True, timeout=60)
     duration = min(10, max(3, math.ceil(seconds)))
-    result = _fal_run(FAL_MOTION_MODEL, {
+    result = _fal_paid("motion", FAL_MOTION_MODEL, {
         "start_image_url": _fal_file_url(still, "image/jpeg"),
         "prompt": (prompt or "").strip() or MOTION_DEFAULT_PROMPT,
         "duration": str(duration),
         "generate_audio": False,  # the reel has its own narration and music
         "negative_prompt": "blur, distort, low quality, text, captions, watermark, morphing faces",
-    }, deadline, "motion")
+    }, deadline, duration)
     raw = _download(result["video"]["url"], out.with_name(out.stem + "-raw.mp4"))
     # Stretch or squeeze to the scene's length so the clip neither freezes nor gets cut short.
     factor = seconds / (probe_duration(raw) or duration)
@@ -546,9 +617,10 @@ def motion_clip(image: Path, prompt: Optional[str], seconds: float, out: Path, d
     return out
 
 
-def add_motion_scenes(props: dict, req: RenderRequest, job_dir: Path, image_paths: list[Path]) -> int:
-    """Swap the requested scenes for animated clips; a scene whose clip fails keeps its image.
-    Card scenes and talking scenes are skipped. Returns how many scenes now move."""
+def add_motion_scenes(props: dict, req: RenderRequest, job_dir: Path, image_paths: list[Path],
+                      failures: Optional[list] = None) -> int:
+    """Swap the requested scenes for animated clips; a scene whose clip fails keeps its image (and is
+    added to `failures`). Card scenes and talking scenes are skipped. Returns how many scenes now move."""
     cuts = props["cuts"]
     talking = set(req.talkingScenes) if req.talkingImage else set()
     wanted = sorted({i for i in req.motionScenes
@@ -570,15 +642,18 @@ def add_motion_scenes(props: dict, req: RenderRequest, job_dir: Path, image_path
                 clip = future.result()
             except Exception as exc:  # fal down, slow or out of credit: keep the image
                 print(f"[motion] scene {i + 1} kept its image: {exc}", flush=True)
+                if failures is not None:
+                    failures.append(f"motion scene {i + 1}")
                 continue
             cuts[i]["source"] = clip.name
             moved += 1
     return moved
 
 
-def add_talking_scenes(props: dict, req: RenderRequest, job_dir: Path, voice_path: Optional[Path]) -> int:
-    """Swap the requested scenes for talking clips; a scene whose clip fails keeps its image.
-    Returns how many scenes now talk."""
+def add_talking_scenes(props: dict, req: RenderRequest, job_dir: Path, voice_path: Optional[Path],
+                       failures: Optional[list] = None) -> int:
+    """Swap the requested scenes for talking clips; a scene whose clip fails keeps its image (and is
+    added to `failures`). Returns how many scenes now talk."""
     cuts = props["cuts"]
     wanted = sorted({i for i in req.talkingScenes if 0 <= i < len(req.scenes)})
     if not (wanted and req.talkingImage and voice_path and FAL_KEY):
@@ -604,6 +679,8 @@ def add_talking_scenes(props: dict, req: RenderRequest, job_dir: Path, voice_pat
                 clip = future.result()
             except Exception as exc:  # fal down, slow or out of credit: keep the image
                 print(f"[talking] scene {i + 1} kept its image: {exc}", flush=True)
+                if failures is not None:
+                    failures.append(f"talking scene {i + 1}")
                 continue
             cuts[i]["source"] = clip.name
             talked += 1
@@ -612,13 +689,17 @@ def add_talking_scenes(props: dict, req: RenderRequest, job_dir: Path, voice_pat
 
 def video_response(path: Path, filename: str, headers: Optional[dict] = None) -> StreamingResponse:
     """Send the MP4 in chunks, without Content-Length. Cloud Run refuses a response sent in one
-    piece if it's over 32 MB, and reels with motion or talking clips can be larger than that."""
+    piece if it's over 32 MB, and reels with motion or talking clips can be larger than that.
+    The file is finished before this is called, so X-Expected-Bytes lets the client spot a cut-off stream."""
+    size = path.stat().st_size
+
     def chunks():
         with path.open("rb") as f:
             while chunk := f.read(1024 * 1024):
                 yield chunk
     return StreamingResponse(chunks(), media_type="video/mp4", headers={
-        "Content-Disposition": f'attachment; filename="{filename}"', **(headers or {})})
+        "Content-Disposition": f'attachment; filename="{filename}"', "X-Expected-Bytes": str(size),
+        **(headers or {})})
 
 
 def render(props: dict, job_dir: Path, aspect: str) -> Path:
@@ -650,9 +731,7 @@ def healthz() -> dict:
 
 
 @app.post("/render")
-def render_reel(req: RenderRequest, background: BackgroundTasks,
-                authorization: Optional[str] = Header(None)) -> StreamingResponse:
-    _check_token(authorization)
+def render_reel(req: RenderRequest, background: BackgroundTasks) -> StreamingResponse:
     job_dir = Path(tempfile.mkdtemp(prefix=f"reel-{uuid.uuid4().hex[:8]}-"))
     background.add_task(shutil.rmtree, job_dir, ignore_errors=True)
     try:
@@ -678,35 +757,37 @@ def render_reel(req: RenderRequest, background: BackgroundTasks,
 
         heard = transcribe(voice_path) if voice_path else None
         props = build_props(req, image_paths, voice_path, voice_seconds, heard)
-        # Talking and motion clips come from fal at the same time.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            talking_job = pool.submit(add_talking_scenes, props, req, job_dir, voice_path)
-            motion_job = pool.submit(add_motion_scenes, props, req, job_dir, image_paths)
-            talked, moved = talking_job.result(), motion_job.result()
-        if music_path:
-            # Explainer adds a one-second fade after the last scene.
-            total = max(c["out_seconds"] for c in props["cuts"]) + 1.0
-            soundtrack = mix_music(voice_path, music_path, total, job_dir, req.musicVolume)
-            props["audio"]["narration"] = {"src": soundtrack.name, "volume": 1}
-        if req.sfx:
-            narration = props["audio"].get("narration")
-            base = job_dir / narration["src"] if narration else None
-            total = max(c["out_seconds"] for c in props["cuts"]) + 1.0
-            try:
-                mixed = mix_sfx(base, sfx_events(props), total, job_dir)
-                props["audio"]["narration"] = {"src": mixed.name, "volume": 1}
-            except Exception as exc:  # effects are a nice-to-have; render without them
-                print(f"[sfx] skipped: {exc}", flush=True)
-        if not _render_lock.acquire(timeout=5):
+        # Taken before fal is called, so a request that is turned away has paid for nothing.
+        if not _render_lock.acquire(timeout=LOCK_WAIT_SECONDS):
             raise HTTPException(429, "Another reel is rendering. Try again in a minute.")
         try:
+            # Talking and motion clips come from fal at the same time.
+            fal_failures: list[str] = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                talking_job = pool.submit(add_talking_scenes, props, req, job_dir, voice_path, failures=fal_failures)
+                motion_job = pool.submit(add_motion_scenes, props, req, job_dir, image_paths, failures=fal_failures)
+                talked, moved = talking_job.result(), motion_job.result()
+            if music_path:
+                # Explainer adds a one-second fade after the last scene.
+                total = max(c["out_seconds"] for c in props["cuts"]) + 1.0
+                soundtrack = mix_music(voice_path, music_path, total, job_dir, req.musicVolume)
+                props["audio"]["narration"] = {"src": soundtrack.name, "volume": 1}
+            if req.sfx:
+                narration = props["audio"].get("narration")
+                base = job_dir / narration["src"] if narration else None
+                total = max(c["out_seconds"] for c in props["cuts"]) + 1.0
+                try:
+                    mixed = mix_sfx(base, sfx_events(props), total, job_dir)
+                    props["audio"]["narration"] = {"src": mixed.name, "volume": 1}
+                except Exception as exc:  # effects are a nice-to-have; render without them
+                    print(f"[sfx] skipped: {exc}", flush=True)
             out = render(props, job_dir, req.aspectRatio)
         finally:
             _render_lock.release()
     except Exception:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise
-    headers = {}
+    headers = {"X-Fal-Failures": str(len(fal_failures))}
     if req.talkingScenes:
         headers["X-Talking-Scenes"] = f"{talked}/{len(set(req.talkingScenes))}"
     if req.motionScenes:
@@ -719,13 +800,21 @@ def render_reel(req: RenderRequest, background: BackgroundTasks,
 # The app picks the moments from the transcript; this service downloads, transcribes and cuts.
 # ---------------------------------------------------------------------------
 
+# /tmp is memory on Cloud Run, so the cache is kept under CLIP_CACHE_MAX_MB by dropping the oldest
+# sources before a new download.
 CLIP_CACHE = Path(os.environ.get("CLIP_CACHE", "/tmp/clip-sources"))
-MAX_SOURCE_BYTES = int(os.environ.get("MAX_SOURCE_MB", "3000")) * 1024 * 1024
+CLIP_CACHE_MAX_BYTES = int(os.environ.get("CLIP_CACHE_MAX_MB", "2500")) * 1024 * 1024
+MAX_SOURCE_BYTES = int(os.environ.get("MAX_SOURCE_MB", "1500")) * 1024 * 1024
 MAX_SOURCE_MINUTES = float(os.environ.get("MAX_SOURCE_MINUTES", "90"))
+DRIVE_DOWNLOAD_DEADLINE_S = float(os.environ.get("DRIVE_DOWNLOAD_DEADLINE_S", "600"))
+# A source handed out this recently may still be read by its request (Cloud Run ends requests at 900 s).
+SOURCE_IN_USE_SECONDS = 900
 MAX_CLIP_SECONDS = 90
 DRIVE_ID_RE = re.compile(r"(?:/d/|[?&]id=)([A-Za-z0-9_-]{20,})")
 _source_locks: dict[str, threading.Lock] = {}
 _source_locks_guard = threading.Lock()
+_cache_guard = threading.Lock()
+_cache_reserved: dict[str, int] = {}  # downloads in progress: file id -> bytes expected
 
 
 def drive_file_id(url: str) -> str:
@@ -736,27 +825,66 @@ def drive_file_id(url: str) -> str:
     return match.group(1)
 
 
+def make_room(cache: Path, needed: int, file_id: str) -> None:
+    """Delete the oldest cached sources until the cache plus `needed` bytes fits CLIP_CACHE_MAX_BYTES.
+    A source whose lock is held, or that was handed out within SOURCE_IN_USE_SECONDS, is kept (other
+    downloads count at their expected size); when the rest can't make room the download is refused
+    instead of filling memory."""
+    with _cache_guard:
+        files = [(f.stat().st_mtime, f.stat().st_size, f) for f in cache.glob("*.video")]
+        total = sum(size for _, size, _ in files) + sum(_cache_reserved.values())
+        now = time.time()
+        for mtime, size, f in sorted(files, key=lambda x: x[0]):
+            if total + needed <= CLIP_CACHE_MAX_BYTES:
+                break
+            lock = _source_locks.get(f.stem)
+            if (lock and lock.locked()) or now - mtime < SOURCE_IN_USE_SECONDS:
+                continue
+            f.unlink(missing_ok=True)
+            total -= size
+            print(f"[clips] dropped cached source {f.name} ({size // (1024 * 1024)} MB) to make room", flush=True)
+        if total + needed > CLIP_CACHE_MAX_BYTES:
+            raise HTTPException(429, "The render service is busy with other videos. Try again in a few minutes.")
+        _cache_reserved[file_id] = needed
+
+
 def _download_drive(file_id: str, dest: Path) -> None:
     url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t"
     tmp = dest.with_suffix(".part")
+    deadline = time.monotonic() + DRIVE_DOWNLOAD_DEADLINE_S
+    too_big = f"That video is over {MAX_SOURCE_BYTES // (1024 * 1024)} MB."
     try:
         with urllib.request.urlopen(url, timeout=60) as resp:
             if "text/html" in (resp.headers.get("Content-Type") or ""):
                 raise HTTPException(400, "Google Drive didn't send the video. Share it as "
                                          "\"Anyone with the link\" and try again.")
+            expected = int(resp.headers.get("Content-Length") or MAX_SOURCE_BYTES)
+            if expected > MAX_SOURCE_BYTES:
+                raise HTTPException(400, too_big)
+            make_room(dest.parent, expected, file_id)
             size = 0
             with tmp.open("wb") as out:
                 while chunk := resp.read(1024 * 1024):
                     size += len(chunk)
                     if size > MAX_SOURCE_BYTES:
-                        raise HTTPException(400, f"That video is over {MAX_SOURCE_BYTES // (1024 * 1024)} MB.")
+                        raise HTTPException(400, too_big)
+                    if time.monotonic() > deadline:
+                        raise HTTPException(504, "Google Drive took too long to send the video.")
                     out.write(chunk)
+        # Checked before it joins the cache, so a video that will be refused doesn't take up memory.
+        duration = probe_duration(tmp)
+        if not duration:
+            raise HTTPException(400, "That file isn't a video we can read.")
+        if duration > MAX_SOURCE_MINUTES * 60:
+            raise HTTPException(400, f"That video is over {int(MAX_SOURCE_MINUTES)} minutes.")
         tmp.rename(dest)
     except urllib.error.HTTPError as exc:
         raise HTTPException(400, f"Google Drive refused the download ({exc.code}). "
                                  "Check the link is shared as \"Anyone with the link\".") from exc
     finally:
         tmp.unlink(missing_ok=True)
+        with _cache_guard:
+            _cache_reserved.pop(file_id, None)
 
 
 def source_video(drive_url: str) -> Path:
@@ -767,7 +895,9 @@ def source_video(drive_url: str) -> Path:
     with lock:
         CLIP_CACHE.mkdir(parents=True, exist_ok=True)
         path = CLIP_CACHE / f"{file_id}.video"
-        if not path.exists():
+        if path.exists():
+            os.utime(path)  # marks it in use, and most recently used, for make_room
+        else:
             _download_drive(file_id, path)
         return path
 
@@ -806,8 +936,7 @@ class ClipRenderRequest(BaseModel):
 
 
 @app.post("/clips/transcribe")
-def clips_transcribe(req: ClipSourceRequest, authorization: Optional[str] = Header(None)) -> dict:
-    _check_token(authorization)
+def clips_transcribe(req: ClipSourceRequest) -> dict:
     src = source_video(req.driveUrl)
     duration = probe_duration(src)
     if not duration:
@@ -879,9 +1008,7 @@ def clip_captions(heard: list[tuple[str, float, float]]) -> list[dict]:
 
 
 @app.post("/clips/render")
-def clips_render(req: ClipRenderRequest, background: BackgroundTasks,
-                 authorization: Optional[str] = Header(None)) -> StreamingResponse:
-    _check_token(authorization)
+def clips_render(req: ClipRenderRequest, background: BackgroundTasks) -> StreamingResponse:
     if req.end - req.start > MAX_CLIP_SECONDS or req.end <= req.start:
         raise HTTPException(400, f"A clip must be between 1 and {MAX_CLIP_SECONDS} seconds.")
     src = source_video(req.driveUrl)
@@ -919,7 +1046,7 @@ def clips_render(req: ClipRenderRequest, background: BackgroundTasks,
                 "captionBackgroundColor": "rgba(0, 0, 0, 0.7)",
             },
         }
-        if not _render_lock.acquire(timeout=5):
+        if not _render_lock.acquire(timeout=LOCK_WAIT_SECONDS):
             raise HTTPException(429, "Another video is rendering. Try again in a minute.")
         try:
             out = render(props, job_dir, "9:16")
@@ -1129,8 +1256,7 @@ def segment_subtitle_crops(src: Path, segments: list[dict], band: dict) -> None:
 
 
 @app.post("/dub/transcribe")
-def dub_transcribe(req: DubTranscribeRequest, authorization: Optional[str] = Header(None)) -> dict:
-    _check_token(authorization)
+def dub_transcribe(req: DubTranscribeRequest) -> dict:
     src = source_video(req.driveUrl)
     duration = probe_duration(src)
     if not duration:
@@ -1167,12 +1293,12 @@ def background_track(audio: Path, job_dir: Path) -> Path:
     small = job_dir / "for-stems.mp3"
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(audio), "-b:a", "192k", str(small)],
                    check=True, capture_output=True, timeout=180)
-    result = _fal_run(FAL_STEMS_MODEL, {
+    result = _fal_paid("stems", FAL_STEMS_MODEL, {
         "audio_url": _fal_file_url(small, "audio/mpeg"),
         "model": "htdemucs",
         "stems": ["drums", "bass", "other"],
         "output_format": "mp3",
-    }, time.monotonic() + STEMS_TIMEOUT_SECONDS, "stems")
+    }, time.monotonic() + STEMS_TIMEOUT_SECONDS, probe_duration(small) or 0.0)
     stems = []
     for name in ("drums", "bass", "other"):
         url = (result.get(name) or {}).get("url")
@@ -1251,9 +1377,7 @@ def subtitle_file(lines: list[DubLine], width: int, height: int, bottom_margin: 
 
 
 @app.post("/dub/render")
-def dub_render(req: DubRenderRequest, background: BackgroundTasks,
-               authorization: Optional[str] = Header(None)) -> StreamingResponse:
-    _check_token(authorization)
+def dub_render(req: DubRenderRequest, background: BackgroundTasks) -> StreamingResponse:
     src = source_video(req.driveUrl)
     total = probe_duration(src)
     if not total:
@@ -1270,7 +1394,7 @@ def dub_render(req: DubRenderRequest, background: BackgroundTasks,
             raise HTTPException(400, f"Keep the intro clip under {MAX_INTRO_SECONDS} seconds.")
     job_dir = Path(tempfile.mkdtemp(prefix=f"dub-{uuid.uuid4().hex[:8]}-"))
     background.add_task(shutil.rmtree, job_dir, ignore_errors=True)
-    if not _render_lock.acquire(timeout=5):
+    if not _render_lock.acquire(timeout=LOCK_WAIT_SECONDS):
         shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(429, "Another video is rendering. Try again in a minute.")
     try:
@@ -1345,4 +1469,5 @@ def dub_render(req: DubRenderRequest, background: BackgroundTasks,
         raise
     finally:
         _render_lock.release()
-    return video_response(out, "dubbed.mp4", {"X-Dub-Background": bed_note})
+    return video_response(out, "dubbed.mp4", {"X-Dub-Background": bed_note,
+                                              "X-Fal-Failures": "1" if bed_note == "failed" else "0"})
