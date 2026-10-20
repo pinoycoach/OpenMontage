@@ -222,10 +222,10 @@ def check_reel(video: Path, images: list[Path], clips: dict[int, Path], credits_
     # --- Render -------------------------------------------------------------------------------------
     lumas = [_luma(f) for f in frames]
     skip = int(FADE_IN_SECONDS * fps) + 1
-    sampled = sorted(set(range(skip, len(frames), max(1, int(fps / 4)))) | {len(frames) - 1})  # + the very last frame
-    black = [round(i / fps, 2) for i in sampled if lumas[i] < BLACK_LUMA]
+    # Every frame after the fade-in, the last one included (0.25 s sampling missed a 1-frame black at a cut).
+    black = [round(i / fps, 2) for i in range(skip, len(frames)) if lumas[i] < BLACK_LUMA]
     checks.append(Check("Render", "no black or empty frames after the fade-in", "FAIL" if black else "PASS",
-                        f"black at {black[:6]} s" if black else "checked every 0.25 s"))
+                        f"black at {black[:6]} s" if black else "checked every frame"))
     dips = []
     for c in cuts:
         a, b = lumas[max(0, c - 4)], lumas[min(len(lumas) - 1, c + 4)]
