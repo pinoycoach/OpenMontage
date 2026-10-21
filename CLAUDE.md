@@ -83,9 +83,9 @@ Goal: 1–2 revisions at most. Don't send a reel to Ben until every box passes. 
 **Send to Ben:** for each reel, the MP4, the 2 fps contact sheet and the preflight lines. List any known leftovers honestly.
 **Merge rule:** PRs that change the live renderer are merged by Nap only after a run passes Ben's QA with zero fails.
 
-**Free reel runs (Nap, 20 Oct 2026):** once Nap has said go on a batch, keep producing from start to finish. Pause and ask only when no usable free image can be found for a reel; log that reel as pending in the ledger and carry on with the rest. Hard fails go to `fix-after-friday/` with the reason, never re-edited. Every finished reel goes in the ledger with its cost. Sending, posting, Drive uploads and merges still need their own yes.
+**Free reel runs (Nap, 20 Oct 2026):** once Nap has said go on a batch, keep producing from start to finish. Pause and ask only when no usable free image can be found for a reel; log that reel as pending in the ledger and carry on with the rest. A face, plate, readable name or logo is fixed in the input (see the next rule); only a reel that can't be fixed that way goes to `fix-after-friday/` with the reason. The output is never hand-edited. Every finished reel goes in the ledger with its cost. Sending, posting, Drive uploads and merges still need their own yes.
 
-**QA comes after, not during (Nap, 21 Oct 2026):** make → automatic preflight (a FAIL is re-made at once) → fix input problems yourself (swap or blur a face, plate, readable name or logo in the source photo, never in the output) → log as "finished, QA pending". Nap and Ben QA the logged batch afterwards; their changes come back as one re-make pass.
+**QA comes after, not during (Nap, 21 Oct 2026):** make → automatic preflight (a FAIL is re-made at once) → fix input problems yourself (swap or blur a face, plate, readable name or logo in the source photo, never in the output) → log as "finished, QA pending". Only the by-eye checks move to the end: one Fable visual-check agent per batch (not per reel), then Nap and Ben QA the logged batch; their changes come back as one re-make pass.
 
 ### Google Cloud $300 credit rule (Nap approved 20 Oct 2026)
 Goal: the credits must turn into revenue, not experiments. The credit expires 5 Jan 2027.
