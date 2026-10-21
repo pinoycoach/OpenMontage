@@ -72,7 +72,9 @@ def stretch_of(frame: np.ndarray, source: Path) -> float | None:
     h, w = g.shape
     # Below the AI tag (ends at about 18% of the height), above the captions, inside pans.
     tpl = g[int(h * 0.20):int(h * 0.62), int(w * 0.15):int(w * 0.85)]
-    best = (-1.0, None)
+    if float(tpl.std()) < 12:  # a plain background (a stick on a bare floor) can't show a stretch: check by eye
+        return None
+    scores = {}
     for sx in (0.85, 0.92, 1.0, 1.08, 1.15):
         for zoom in np.arange(1.0, 1.31, 0.03):  # fine steps: a coarse grid matched a zoom-in as a stretch
             k = h / src.shape[0] * zoom
@@ -80,9 +82,14 @@ def stretch_of(frame: np.ndarray, source: Path) -> float | None:
             if img.shape[0] < tpl.shape[0] or img.shape[1] < tpl.shape[1]:
                 continue
             score = float(cv2.matchTemplate(img, tpl, cv2.TM_CCOEFF_NORMED).max())
-            if score > best[0]:
-                best = (score, sx)
-    return best[1] if best[0] > 0.45 else None
+            scores[sx] = max(score, scores.get(sx, -1.0))
+    if not scores or max(scores.values()) <= 0.45:
+        return None
+    best = max(scores, key=scores.get)
+    # Call a stretch only when it clearly beats the uniform scale; on low-texture frames the scores tie.
+    if scores.get(1.0, -1.0) >= scores[best] - 0.02:
+        return 1.0
+    return best
 
 
 def _rel_lum(v: float) -> float:

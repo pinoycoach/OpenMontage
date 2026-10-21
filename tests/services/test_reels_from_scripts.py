@@ -124,6 +124,7 @@ def test_main_stops_before_rendering_when_inputs_are_missing(tmp_path, capsys, m
 # --- renderer caption paging and the preflight checks ------------------------------------------------
 import os  # noqa: E402
 
+import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 
 os.environ.setdefault("RENDER_TOKEN", "test")
@@ -199,3 +200,30 @@ def test_review_writes_one_image_per_scene(tmp_path):
     paths = review_frames.write_review(video, tmp_path)
     assert [p.name for p in paths] == ["reel-review-s01.jpg", "reel-review-s02.jpg"]
     assert cv2.imread(str(paths[0])).shape == (960, 1080, 3)
+
+
+def _textured(h=1440, w=960, seed=3):
+    rng = np.random.default_rng(seed)
+    img = (rng.random((h // 16, w // 16)) * 255).astype(np.uint8)
+    return cv2.resize(img, (w, h), interpolation=cv2.INTER_CUBIC)
+
+
+def test_stretch_check_finds_a_real_stretch_and_passes_a_uniform_scale(tmp_path):
+    src = _textured()
+    path = tmp_path / "src.png"
+    cv2.imwrite(str(path), src)
+    h = 480
+    uniform = cv2.resize(src, (int(src.shape[1] * h / src.shape[0]), h))[:, :270]
+    stretched = cv2.resize(src, (int(src.shape[1] * h / src.shape[0] * 1.15), h))[:, :270]
+    assert preflight.stretch_of(cv2.cvtColor(uniform, cv2.COLOR_GRAY2BGR), path) == 1.0
+    assert preflight.stretch_of(cv2.cvtColor(stretched, cv2.COLOR_GRAY2BGR), path) == 1.15
+
+
+def test_stretch_check_hands_a_plain_background_to_the_eye(tmp_path):
+    """A stick on a bare floor once failed as 'x1.08' with no stretch at all (arnis, batch 6)."""
+    src = np.full((1920, 1080), 180, np.uint8)
+    cv2.line(src, (540, 300), (560, 1600), 60, 18)
+    path = tmp_path / "plain.png"
+    cv2.imwrite(str(path), src)
+    frame = cv2.cvtColor(cv2.resize(src, (270, 480)), cv2.COLOR_GRAY2BGR)
+    assert preflight.stretch_of(frame, path) in (None, 1.0)
