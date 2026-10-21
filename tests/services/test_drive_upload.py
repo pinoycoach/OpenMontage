@@ -30,13 +30,24 @@ def test_dry_run_needs_no_credentials(tmp_path, monkeypatch):
 
 
 def test_a_real_upload_without_a_key_stops_with_a_clear_message(tmp_path, monkeypatch, capsys):
-    monkeypatch.delenv("GDRIVE_SA_KEY", raising=False)
+    for k in ("GDRIVE_SA_KEY", "GDRIVE_CLIENT_ID", "GDRIVE_CLIENT_SECRET", "GDRIVE_REFRESH_TOKEN"):
+        monkeypatch.delenv(k, raising=False)
     assert du.main([str(_batch(tmp_path)), "--parent", "PARENT"]) == 1
-    assert "GDRIVE_SA_KEY is not set" in capsys.readouterr().err
+    assert "GDRIVE_REFRESH_TOKEN" in capsys.readouterr().err
 
 
 def test_a_bad_key_is_reported_without_echoing_it(tmp_path, monkeypatch, capsys):
+    for k in ("GDRIVE_CLIENT_ID", "GDRIVE_CLIENT_SECRET", "GDRIVE_REFRESH_TOKEN"):
+        monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("GDRIVE_SA_KEY", "not-json-secret-123")
     assert du.main([str(_batch(tmp_path)), "--parent", "PARENT"]) == 1
     err = capsys.readouterr().err
     assert "not valid JSON" in err and "secret-123" not in err
+
+
+def test_user_sign_in_is_used_when_all_three_values_are_set(monkeypatch):
+    monkeypatch.setenv("GDRIVE_CLIENT_ID", "id")
+    monkeypatch.setenv("GDRIVE_CLIENT_SECRET", "secret")
+    monkeypatch.setenv("GDRIVE_REFRESH_TOKEN", "1//refresh")
+    s, who = du._session()
+    assert who == "Nap's Google account" and s.credentials.refresh_token == "1//refresh"

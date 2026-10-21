@@ -1,8 +1,11 @@
 """Upload a finished batch folder to Google Drive (KGL DELIVERIES), so Drive for desktop syncs it to Nap's laptop.
 
 The Drive connector only takes small text files; this uses Drive's resumable upload, so MP4s of any size go up.
-Credentials: a Google service-account key (JSON) in the environment variable GDRIVE_SA_KEY. It is never printed or
-written to disk. Share the Drive folder with the service account's e-mail as Editor first.
+Credentials: Nap's own Google sign-in, as three environment variables set in the environment's settings (never in
+chat, never printed): GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET, GDRIVE_REFRESH_TOKEN (from the OAuth Playground, scope
+https://www.googleapis.com/auth/drive). Files are owned by Nap and use his Drive storage. (A service account can't be
+used: Google gives service accounts no storage of their own in a personal My Drive.) GDRIVE_SA_KEY still works for a
+Shared Drive.
 
   python services/reel_render/drive_upload.py <batch_folder> --parent <drive_folder_id> [--dry-run]
 """
@@ -32,10 +35,20 @@ def files_to_upload(folder: Path) -> list[Path]:
 
 
 def _session():
+    from google.auth.transport.requests import AuthorizedSession
+
+    env = {k: os.environ.get(k, "").strip() for k in ("GDRIVE_CLIENT_ID", "GDRIVE_CLIENT_SECRET", "GDRIVE_REFRESH_TOKEN")}
+    if all(env.values()):
+        from google.oauth2.credentials import Credentials
+
+        creds = Credentials(None, refresh_token=env["GDRIVE_REFRESH_TOKEN"], client_id=env["GDRIVE_CLIENT_ID"],
+                            client_secret=env["GDRIVE_CLIENT_SECRET"], token_uri="https://oauth2.googleapis.com/token",
+                            scopes=SCOPES)
+        return AuthorizedSession(creds), "Nap's Google account"
     key = os.environ.get("GDRIVE_SA_KEY", "").strip()
     if not key:
-        raise UploadError("GDRIVE_SA_KEY is not set: add the service-account key in the environment's settings")
-    from google.auth.transport.requests import AuthorizedSession
+        missing = [k for k, v in env.items() if not v]
+        raise UploadError(f"Drive sign-in is not set: add {', '.join(missing)} in the environment's settings")
     from google.oauth2 import service_account
 
     try:
