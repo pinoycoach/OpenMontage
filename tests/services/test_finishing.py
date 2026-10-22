@@ -115,3 +115,11 @@ def test_finish_never_boosts_a_silent_track(tmp_path: Path):
     info = finishing.finish(raw, out, ai_label=False)
     assert info["lufs"] is None and out.exists()
     assert finishing.loudness(out) in (None,) or finishing.loudness(out) < finishing.SILENT_LUFS
+
+
+def test_label_filter_uses_the_given_wording():
+    """--ai-label-text in the batch script reaches the burned-in tag (e.g. "AI-generated concept")."""
+    import finishing
+
+    assert "text='AI-generated concept'" in finishing.label_filter(None, "AI-generated concept")
+    assert "text='AI-generated'" in finishing.label_filter(None)

@@ -325,7 +325,7 @@ def main(argv: list[str] | None = None) -> int:
                 raw = work / "raw.mp4"
                 render_in_process(body, raw)
                 final = args.out / f"{slug}.mp4"
-                finish(raw, final, ai_label)
+                finish(raw, final, ai_label, label_text=AI_LABEL)
             except (ReelError, subprocess.CalledProcessError) as exc:
                 print(f"[{slug}] failed: {exc}", file=sys.stderr)
                 report.append(f"{slug}: FAILED after {time.monotonic() - t0:.0f} s: {exc}")

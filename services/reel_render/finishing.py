@@ -39,10 +39,11 @@ def find_font() -> str | None:
     return out.stdout.strip() or None
 
 
-def label_filter(font: str | None = None) -> str:
+def label_filter(font: str | None = None, text: str = AI_LABEL) -> str:
     """The ffmpeg drawtext filter for the tag: white text on a dark box, top left."""
     font_arg = f"fontfile={font}:" if font else ""
-    return (f"drawtext={font_arg}text='{AI_LABEL}':fontsize={LABEL_FONT_SIZE}:fontcolor=white:box=1:"
+    text = text.replace("'", "").replace(":", "")  # drawtext quoting
+    return (f"drawtext={font_arg}text='{text}':fontsize={LABEL_FONT_SIZE}:fontcolor=white:box=1:"
             f"boxcolor=black@0.6:boxborderw=10:x={LABEL_X}:y={LABEL_Y}")
 
 
@@ -96,12 +97,12 @@ def shape_audio(raw: Path, gain: float, dest: Path, target_lufs: float = TARGET_
 
 
 def finish(raw: Path, out: Path, ai_label: bool, normalize: bool = True, target_lufs: float = TARGET_LUFS,
-           preset: str = "slow") -> dict:
+           preset: str = "slow", label_text: str = AI_LABEL) -> dict:
     """The final file: the AI label burned in top left (when asked) and the audio at the target loudness
     (when asked, and the track isn't silent). Returns what was done and the final measurements:
     {"aiLabel": bool, "lufs": float | None, "truePeak": float | None}; the measurements are None when the
     audio was left as it was (so nothing extra is measured) or the file has no audio."""
-    vf = [label_filter(find_font())] if ai_label else []
+    vf = [label_filter(find_font(), label_text)] if ai_label else []
     audio = None
     if normalize and has_audio(raw):
         lufs = loudness(raw)
