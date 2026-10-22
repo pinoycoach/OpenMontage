@@ -130,8 +130,9 @@ END_CARD_SECONDS = 2.5
 TAIL_SECONDS = 0.0
 # Without word timings, the last scene runs this long past its last caption word, so the line can be read.
 LAST_LINE_HOLD = 0.5
-# Straight cuts between scenes (no dip to black); only the first scene fades in, quickly.
-FIRST_FADE_IN = 0.3
+# Straight cuts everywhere, the first scene included: a fade-in on frame 1 is a blank opening frame,
+# and short-form viewers decide in the first second (skills/creative/short-form.md: movement and text
+# in frame 1, no fade-in). The composer's default is a spring fade-in, so "cut" has to be explicit.
 
 
 class Scene(BaseModel):
@@ -395,9 +396,8 @@ def build_props(req: RenderRequest, image_paths: list[Path], voice_path: Optiona
             "in_seconds": start,
             "out_seconds": end,
             "animation": MOTION_MAP.get(motion, motion),
-            "transition_in": "fade" if i == 0 else "cut",
+            "transition_in": "cut",
             "transition_out": "cut",
-            "transition_duration": FIRST_FADE_IN,
         }
         if scene.card:
             cut["type"] = "reel_card"

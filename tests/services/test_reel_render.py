@@ -99,6 +99,9 @@ class TestBuildProps:
         props = rr.build_props(req, imgs, tmp_path / "voiceover.wav", 4.0)
         assert [c["source"] for c in props["cuts"]] == ["scene-1.png", "scene-2.png"]
         assert [c["animation"] for c in props["cuts"]] == ["zoom-in", "ken-burns"]
+        # Frame 1 is a picture, not a fade from black: every cut, the first included, is a hard cut.
+        assert [(c["transition_in"], c["transition_out"]) for c in props["cuts"]] == [("cut", "cut"), ("cut", "cut")]
+        assert "transition_duration" not in props["cuts"][0]
         assert props["audio"]["narration"]["src"] == "voiceover.wav"
         # With narration, captions follow the spoken line.
         assert props["captions"][0]["word"] == "Stop"
