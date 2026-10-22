@@ -71,7 +71,7 @@ Goal: 1–2 revisions at most. Don't send a reel to Ben until every box passes. 
 - Each image has at least 3 script words (enforced by the split).
 
 **Render (check the output)**
-- No black or empty frames anywhere except the 0.3 s fade-in. One frame every 0.25 s plus the very last frame; mean luma under 8 is a FAIL.
+- No black or empty frames anywhere, frame 1 included: no fade-in (changed 23 Oct 2026, the hook rule). Frame 1 is the picture itself (at least 80% as bright as the shot at 0.5 s) and the hook text is on screen by 0.5 s. Every frame is checked; mean luma under 8 is a FAIL.
 - Transitions are a straight cut or a crossfade of 0.2 s or more. No dip to black.
 - Captions on a near-solid dark box, in white or yellow text, never coloured to match the background.
 - The last caption sits on the last photo, with a hold of 0.5 s or more.
