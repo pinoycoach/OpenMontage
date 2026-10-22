@@ -130,6 +130,18 @@ restarts) past it isn't sent; the scene or background falls back as if fal had f
 and `/dub/render` report failed or refused fal jobs in `X-Fal-Failures` (a count). The estimates are in
 `FAL_USD_PER_SECOND` and `FAL_STEMS_USD` in `app.py`; the fal dashboard has the real charges.
 
+## The finishing pass (on by default)
+
+Every `/render` output goes through `finishing.py` before it is sent, the same pass the batch script
+(`reels_from_scripts.py`) runs: the **"AI-generated" tag** is burned in top left on every frame, and the
+**audio is set to -14 LUFS with the true peak at -1 dBTP or below**, measured on the encoded AAC track
+(the encoder overshoots bright music by a few dB, so the limiter retries until it holds). A silent,
+captions-only track is never boosted. Two request fields switch the halves off, for a reel with nothing
+AI in it: `"aiLabel": false` and `"normalizeAudio": false`. The response says what was done:
+`X-Ai-Label` (`1` or `0`), and `X-Loudness-Lufs` and `X-True-Peak-Dbtp` when the audio was shaped.
+The pass re-encodes the video (libx264, preset slow, CRF 18), which adds about as long again as the
+Remotion render on a short reel. Clips and dubs don't get it yet.
+
 ## Cards, particles and motion scenes (optional)
 
 - **Animated cards.** A scene with `card: {kind: "stat"|"list"|"quote", title, label, items, source}`

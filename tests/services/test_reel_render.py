@@ -25,6 +25,11 @@ PNG_URL = "data:image/png;base64," + base64.b64encode(PNG_1PX).decode()
 WAV_URL = "data:audio/wav;base64," + base64.b64encode(b"RIFF....WAVEfmt ").decode()
 
 
+def _no_finish(raw, req, job_dir):
+    """Stands in for the finishing pass where the render is stubbed: hands the stub file back untouched."""
+    return raw, {}
+
+
 def _request(**overrides) -> rr.RenderRequest:
     body = {
         "scenes": [
@@ -122,6 +127,7 @@ class TestEndpoint:
             return out
 
         monkeypatch.setattr(rr, "render", fake_render)
+        monkeypatch.setattr(rr, "finish_reel", _no_finish)  # the stub's bytes aren't a video ffmpeg can finish
         return TestClient(rr.app)
 
     def _body(self):
@@ -217,6 +223,7 @@ class TestMusic:
             return out
 
         monkeypatch.setattr(rr, "render", fake_render)
+        monkeypatch.setattr(rr, "finish_reel", _no_finish)  # the stub's bytes aren't a video ffmpeg can finish
         tone = self._tone(tmp_path / "m.wav", 1, 220).read_bytes()
         music_url = "data:audio/wav;base64," + base64.b64encode(tone).decode()
         body = {"scenes": [{"image": PNG_URL, "durationSeconds": 2}], "music": music_url}
@@ -302,6 +309,7 @@ class TestTalkingScenes:
             return out
 
         monkeypatch.setattr(rr, "render", fake_render)
+        monkeypatch.setattr(rr, "finish_reel", _no_finish)  # the stub's bytes aren't a video ffmpeg can finish
         tone = self._tone(tmp_path / "v.wav", 2).read_bytes()
         body = {"scenes": [{"image": PNG_URL, "durationSeconds": 2}],
                 "voiceover": "data:audio/wav;base64," + base64.b64encode(tone).decode(),
@@ -450,6 +458,7 @@ class TestCardsAndMotion:
             return out
 
         monkeypatch.setattr(rr, "render", fake_render)
+        monkeypatch.setattr(rr, "finish_reel", _no_finish)  # the stub's bytes aren't a video ffmpeg can finish
         body = {"scenes": [{"image": PNG_URL, "durationSeconds": 2}], "motionScenes": [0]}
         res = TestClient(rr.app).post("/render", json=body, headers={"Authorization": "Bearer secret"})
         assert res.status_code == 200
@@ -717,6 +726,7 @@ class TestSafety:
             out.write_bytes(b"fake-mp4")
             return out
         monkeypatch.setattr(rr, "render", fake_render)
+        monkeypatch.setattr(rr, "finish_reel", _no_finish)  # the stub's bytes aren't a video ffmpeg can finish
 
     def test_every_post_route_needs_the_token_even_with_a_bad_body(self, monkeypatch):
         monkeypatch.setattr(rr, "RENDER_TOKEN", "secret")
@@ -886,3 +896,66 @@ class TestSourceCache:
             rr.source_video(f"https://drive.google.com/file/d/{self.NEW}/view")
         assert exc.value.status_code == 504
         assert list(cache.iterdir()) == []
+
+
+class TestFinishing:
+    """Every /render output goes through the finishing pass (the AI tag and -14 LUFS) unless asked not to."""
+
+    def _client(self, monkeypatch, calls: list):
+        monkeypatch.setattr(rr, "RENDER_TOKEN", "secret")
+
+        def fake_render(props, job_dir, aspect):
+            out = job_dir / "reel.mp4"
+            out.write_bytes(b"raw-render")
+            return out
+
+        def fake_finish(raw, out, ai_label, normalize=True, **_):
+            calls.append({"ai_label": ai_label, "normalize": normalize})
+            out.write_bytes(b"finished")
+            return {"aiLabel": ai_label, "lufs": -14.2 if normalize else None, "truePeak": -1.3 if normalize else None}
+
+        monkeypatch.setattr(rr, "render", fake_render)
+        monkeypatch.setattr(rr.finishing, "finish", fake_finish)
+        return TestClient(rr.app)
+
+    def test_label_and_loudness_are_on_by_default(self):
+        req = rr.RenderRequest(scenes=[{"image": PNG_URL, "durationSeconds": 2}])
+        assert req.aiLabel is True and req.normalizeAudio is True
+
+    def test_render_returns_the_finished_file_and_says_so(self, monkeypatch):
+        calls: list = []
+        client = self._client(monkeypatch, calls)
+        body = {"scenes": [{"image": PNG_URL, "durationSeconds": 2}]}
+        res = client.post("/render", json=body, headers={"Authorization": "Bearer secret"})
+        assert res.status_code == 200
+        assert res.content == b"finished"
+        assert calls == [{"ai_label": True, "normalize": True}]
+        assert res.headers["x-ai-label"] == "1"
+        assert res.headers["x-loudness-lufs"] == "-14.2"
+        assert res.headers["x-true-peak-dbtp"] == "-1.3"
+        assert res.headers["x-expected-bytes"] == str(len(b"finished"))
+
+    def test_label_can_be_switched_off_for_a_reel_with_nothing_ai(self, monkeypatch):
+        calls: list = []
+        client = self._client(monkeypatch, calls)
+        body = {"scenes": [{"image": PNG_URL, "durationSeconds": 2}], "aiLabel": False}
+        res = client.post("/render", json=body, headers={"Authorization": "Bearer secret"})
+        assert res.status_code == 200
+        assert calls == [{"ai_label": False, "normalize": True}]
+        assert res.headers["x-ai-label"] == "0"
+
+    def test_both_off_returns_the_raw_render_untouched(self, monkeypatch):
+        calls: list = []
+        client = self._client(monkeypatch, calls)
+        body = {"scenes": [{"image": PNG_URL, "durationSeconds": 2}], "aiLabel": False, "normalizeAudio": False}
+        res = client.post("/render", json=body, headers={"Authorization": "Bearer secret"})
+        assert res.status_code == 200
+        assert res.content == b"raw-render"
+        assert calls == []
+        assert "x-ai-label" not in res.headers and "x-loudness-lufs" not in res.headers
+
+    def test_finish_headers_leave_out_what_was_not_measured(self):
+        assert rr.finish_headers({}) == {}
+        assert rr.finish_headers({"aiLabel": True, "lufs": None, "truePeak": None}) == {"X-Ai-Label": "1"}
+        assert rr.finish_headers({"aiLabel": False, "lufs": -13.96, "truePeak": -1.04}) == {
+            "X-Ai-Label": "0", "X-Loudness-Lufs": "-14.0", "X-True-Peak-Dbtp": "-1.0"}

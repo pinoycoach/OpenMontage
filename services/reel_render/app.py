@@ -41,6 +41,11 @@ from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Re
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+try:  # imported as the package services.reel_render.app (tests, uvicorn from the repo root)
+    from . import finishing
+except ImportError:  # imported as a plain module beside this file (reels_from_scripts.py)
+    import finishing
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 COMPOSER_DIR = REPO_ROOT / "remotion-composer"
 RENDER_TOKEN = os.environ.get("RENDER_TOKEN", "")
@@ -163,6 +168,10 @@ class RenderRequest(BaseModel):
     endCard: Optional[EndCard] = None
     # Whoosh on scene changes and a soft pop when a card appears, mixed under the voice.
     sfx: bool = False
+    # The finishing pass (finishing.py), on by default: the "AI-generated" tag on every frame, and the
+    # audio at -14 LUFS with the true peak at -1 dBTP or below. Off only for a reel with nothing AI in it.
+    aiLabel: bool = True
+    normalizeAudio: bool = True
 
 
 OPEN_PATHS = {"/health", "/healthz"}
@@ -786,6 +795,27 @@ def render(props: dict, job_dir: Path, aspect: str) -> Path:
     return out
 
 
+def finish_reel(raw: Path, req: RenderRequest, job_dir: Path) -> tuple[Path, dict]:
+    """The label and loudness pass on a rendered reel (finishing.finish). With both switched off the raw
+    render is returned as it is. Returns (final file, what was done) for the response headers."""
+    if not (req.aiLabel or req.normalizeAudio):
+        return raw, {}
+    out = job_dir / "final.mp4"
+    return out, finishing.finish(raw, out, ai_label=req.aiLabel, normalize=req.normalizeAudio)
+
+
+def finish_headers(info: dict) -> dict:
+    """Response headers saying what the finishing pass did: the tag, and the measured loudness and peak."""
+    headers = {}
+    if "aiLabel" in info:
+        headers["X-Ai-Label"] = "1" if info["aiLabel"] else "0"
+    if info.get("lufs") is not None:
+        headers["X-Loudness-Lufs"] = f"{info['lufs']:.1f}"
+    if info.get("truePeak") is not None:
+        headers["X-True-Peak-Dbtp"] = f"{info['truePeak']:.1f}"
+    return headers
+
+
 @app.get("/health")  # Cloud Run reserves paths ending in "z", so /healthz never reaches the app there
 @app.get("/healthz")
 def healthz() -> dict:
@@ -850,12 +880,14 @@ def render_reel(req: RenderRequest, background: BackgroundTasks) -> StreamingRes
                 except Exception as exc:  # effects are a nice-to-have; render without them
                     print(f"[sfx] skipped: {exc}", flush=True)
             out = render(props, job_dir, req.aspectRatio)
+            # The tag and the loudness pass, inside the lock: it re-encodes the video on the same CPUs.
+            out, finished = finish_reel(out, req, job_dir)
         finally:
             _render_lock.release()
     except Exception:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise
-    headers = {"X-Fal-Failures": str(len(fal_failures))}
+    headers = {"X-Fal-Failures": str(len(fal_failures)), **finish_headers(finished)}
     if req.talkingScenes:
         headers["X-Talking-Scenes"] = f"{talked}/{len(set(req.talkingScenes))}"
     if req.motionScenes:
