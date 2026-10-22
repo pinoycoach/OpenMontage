@@ -81,6 +81,11 @@ class TestWordCaptions:
     def test_empty(self):
         assert rr.word_captions("   ", 0, 2) == []
 
+    def test_no_caption_gap_at_a_cut(self):
+        first = rr.word_captions("Shaved ice, gatas, saging", 0.0, 3.5)
+        second = rr.word_captions("Pero bago kainin, kailangan", 3.5, 7.0)
+        assert first[0]["startMs"] == 0 and first[-1]["endMs"] == 3500 == second[0]["startMs"]
+
 
 class TestBuildProps:
     def test_vertical_reel(self, tmp_path: Path):

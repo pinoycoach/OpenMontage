@@ -124,6 +124,7 @@ def test_main_stops_before_rendering_when_inputs_are_missing(tmp_path, capsys, m
 # --- renderer caption paging and the preflight checks ------------------------------------------------
 import os  # noqa: E402
 
+import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 
 os.environ.setdefault("RENDER_TOKEN", "test")
@@ -131,7 +132,7 @@ import app as renderer  # noqa: E402
 import preflight  # noqa: E402
 
 
-@pytest.mark.parametrize("count, sizes", [(1, [1]), (4, [4]), (5, [3, 2]), (7, [4, 3]), (9, [3, 3, 3]), (13, [4, 3, 3, 3])])
+@pytest.mark.parametrize("count, sizes", [(1, [1]), (4, [4]), (5, [5]), (6, [6]), (7, [4, 3]), (9, [3, 3, 3]), (13, [4, 3, 3, 3])])
 def test_caption_pages_are_balanced_and_never_one_word(count, sizes):
     breaks = sorted(renderer.page_breaks(count, 4))
     got = [b - a for a, b in zip([-1, *breaks], breaks)]
@@ -157,3 +158,89 @@ def test_preflight_straight_cut_is_not_a_dip():
     c = preflight.scene_cuts(frames)[0]
     lumas = [preflight._luma(f) for f in frames]
     assert not min(lumas[c - 2:c + 3]) < preflight.DIP_RATIO * min(lumas[c - 4], lumas[c + 4])
+
+
+def _caption_frame(bg_value: int, box: bool, text: bool):
+    import cv2
+    f = np.full((480, 270, 3), bg_value, np.uint8)
+    if box:
+        cv2.rectangle(f, (40, 330), (230, 362), (20, 20, 20), -1)
+        if text:
+            cv2.putText(f, "Comment below", (52, 352), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+    return f
+
+
+def test_caption_box_found_with_good_contrast_on_bright_frame():
+    b = preflight.caption_box(_caption_frame(235, box=True, text=True))
+    assert b and b["contrast"] >= preflight.MIN_CONTRAST and b["bg"] <= 50
+
+
+def test_no_caption_box_without_box_or_text():
+    assert preflight.caption_box(_caption_frame(235, box=False, text=False)) is None
+    assert preflight.caption_box(_caption_frame(235, box=True, text=False)) is None
+
+
+# --- review frames for the by-eye checks --------------------------------------------------------------
+import review_frames  # noqa: E402
+
+
+def test_review_samples_two_frames_per_still_and_every_second_of_a_clip():
+    times = review_frames.sample_times([0, 40, 130], 30.0, motion={1})
+    assert times[0] == [0.3, 0.97]
+    assert times[1] == [1.33, 2.33, 3.33]
+
+
+def test_review_writes_one_image_per_scene(tmp_path):
+    import cv2
+    video = tmp_path / "reel.mp4"
+    w = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"mp4v"), 30, (270, 480))
+    for v in [60] * 30 + [200] * 30:
+        w.write(np.full((480, 270, 3), v, np.uint8))
+    w.release()
+    paths = review_frames.write_review(video, tmp_path)
+    assert [p.name for p in paths] == ["reel-review-s01.jpg", "reel-review-s02.jpg"]
+    assert cv2.imread(str(paths[0])).shape == (960, 1080, 3)
+
+
+def _textured(h=1440, w=960, seed=3):
+    rng = np.random.default_rng(seed)
+    img = (rng.random((h // 16, w // 16)) * 255).astype(np.uint8)
+    return cv2.resize(img, (w, h), interpolation=cv2.INTER_CUBIC)
+
+
+def test_stretch_check_finds_a_real_stretch_and_passes_a_uniform_scale(tmp_path):
+    src = _textured()
+    path = tmp_path / "src.png"
+    cv2.imwrite(str(path), src)
+    h = 480
+    uniform = cv2.resize(src, (int(src.shape[1] * h / src.shape[0]), h))[:, :270]
+    stretched = cv2.resize(src, (int(src.shape[1] * h / src.shape[0] * 1.15), h))[:, :270]
+    assert preflight.stretch_of(cv2.cvtColor(uniform, cv2.COLOR_GRAY2BGR), path) == 1.0
+    assert preflight.stretch_of(cv2.cvtColor(stretched, cv2.COLOR_GRAY2BGR), path) == 1.15
+
+
+def test_stretch_check_hands_a_plain_background_to_the_eye(tmp_path):
+    """A stick on a bare floor once failed as 'x1.08' with no stretch at all (arnis, batch 6)."""
+    src = np.full((1920, 1080), 180, np.uint8)
+    cv2.line(src, (540, 300), (560, 1600), 60, 18)
+    path = tmp_path / "plain.png"
+    cv2.imwrite(str(path), src)
+    frame = cv2.cvtColor(cv2.resize(src, (270, 480)), cv2.COLOR_GRAY2BGR)
+    assert preflight.stretch_of(frame, path) in (None, 1.0)
+
+
+def test_finish_keeps_the_true_peak_at_or_below_minus_one(tmp_path):
+    """A loud, bright track (the kind AAC overshoots) comes out at -1 dBTP or below after finish()."""
+    import shutil
+    import subprocess
+
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg not installed")
+    raw = tmp_path / "raw.mp4"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=gray:s=108x192:d=3",
+                    "-f", "lavfi", "-i", "anoisesrc=d=3:c=white:a=0.9", "-shortest", "-c:v", "libx264",
+                    "-c:a", "aac", str(raw)], check=True)
+    out = tmp_path / "out.mp4"
+    rfs.finish(raw, out, ai_label=False)
+    tp = rfs.true_peak(out)
+    assert tp is not None and tp <= rfs.TRUE_PEAK_MAX

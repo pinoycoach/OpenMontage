@@ -230,9 +230,12 @@ def scene_timeline(durations: list[float], voice_seconds: Optional[float]) -> li
 
 def page_breaks(count: int, per_page: int) -> set[int]:
     """Word positions (0-based) to end a caption page after, so a line's pages are as even as possible
-    and never leave one word alone: 5 words → 3 + 2, 9 → 3 + 3 + 3. The last word always ends a page."""
+    and never leave one word alone. A line of up to per_page + 2 words is one page (so "Nilagyan ng mga Pinoy
+    ng bubong," reads as one caption); longer lines split evenly: 7 → 4 + 3, 9 → 3 + 3 + 3."""
     if count <= 0:
         return set()
+    if count <= per_page + 2:  # a short line (up to 6 words on vertical) stays whole: one page, two rows
+        return {count - 1}
     pages = -(-count // per_page)
     base, extra = divmod(count, pages)
     out, k = set(), 0
@@ -243,12 +246,12 @@ def page_breaks(count: int, per_page: int) -> set[int]:
 
 
 def word_captions(text: str, start: float, end: float, per_page: int = 4) -> list[dict]:
-    """Spread a line's words across its scene, weighted by word length."""
+    """Spread a line's words across its whole scene, weighted by word length. No inset at the edges:
+    an inset left a caption gap of up to 0.3 s at every cut in reels without a voice."""
     words = text.split()
     if not words or end <= start:
         return []
-    inset = min(0.15, (end - start) * 0.05)
-    t0, t1 = start + inset, end - inset
+    t0, t1 = start, end
     weights = [len(w) + 2 for w in words]
     total = sum(weights)
     breaks = page_breaks(len(words), per_page)
@@ -412,9 +415,12 @@ def build_props(req: RenderRequest, image_paths: list[Path], voice_path: Optiona
         # End on the last scene, with its caption still on screen.
         "tailSeconds": TAIL_SECONDS,
         "holdLastCaption": not req.endCard,
+        # Caption pages appear at full opacity at once: a fading page is unreadable on bright frames.
+        "captionEntrance": "none",
         # Big, short caption pages that sit above the Reels/TikTok UI on vertical video.
         "captionFontSize": 76 if vertical else 56,
-        "captionWordsPerPage": per_page,
+        # The composer's hard limit; page_breaks() already splits lines (short lines stay whole up to +2).
+        "captionWordsPerPage": per_page + 2,
         "captionBottomOffset": 460 if vertical else 90,
         "themeConfig": {
             "backgroundColor": "#000000",

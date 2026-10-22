@@ -877,7 +877,8 @@ export const Explainer: React.FC<ExplainerProps> = (props) => {
       {/* Layer 1: Visual scenes */}
       {cuts.map((cut) => {
         const from = Math.round(cut.in_seconds * fps);
-        let duration = Math.round((cut.out_seconds - cut.in_seconds) * fps);
+        // End on the frame where the next scene starts: rounding the length on its own left a black frame at a cut.
+        let duration = Math.max(1, Math.round(cut.out_seconds * fps) - from);
         // The scene that ends last runs to the end of the video, so rounding never leaves an empty frame.
         if (cut.out_seconds >= lastOut) duration = Math.max(duration, durationInFrames - from);
 
@@ -912,6 +913,7 @@ export const Explainer: React.FC<ExplainerProps> = (props) => {
         <CaptionOverlay
           words={captions}
           holdLastPageUntilMs={props.holdLastCaption ? (durationInFrames / fps) * 1000 : undefined}
+          instant={props.captionEntrance === "none"}
           wordsPerPage={(props.captionWordsPerPage as number) ?? 6}
           fontSize={(props.captionFontSize as number) ?? 42}
           bottomOffset={(props.captionBottomOffset as number) ?? 80}

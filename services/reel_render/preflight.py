@@ -19,6 +19,10 @@ DIP_RATIO = 0.5         # at a cut, a frame darker than half of both neighbours 
 CUT_DIFF = 20           # mean frame difference (0-255, small frames) that marks a scene change
 LUFS_TARGET, LUFS_TOL = -14.0, 1.0
 HOLD_SECONDS = 0.5
+# Caption band of a vertical reel (fractions of the height): the box sits 460 px above the bottom.
+CAPTION_BAND = (0.66, 0.765)
+MIN_CONTRAST = 4.5      # WCAG AA for text
+MUSIC_TAIL_DB = 30      # after the voice, the music bed must be within this many dB of the voice
 
 
 @dataclass
@@ -66,18 +70,55 @@ def stretch_of(frame: np.ndarray, source: Path) -> float | None:
         return None
     g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     h, w = g.shape
-    tpl = g[int(h * 0.12):int(h * 0.62), int(w * 0.15):int(w * 0.85)]  # above the captions, inside pans
-    best = (-1.0, None)
+    # Below the AI tag (ends at about 18% of the height), above the captions, inside pans.
+    tpl = g[int(h * 0.20):int(h * 0.62), int(w * 0.15):int(w * 0.85)]
+    if float(tpl.std()) < 12:  # a plain background (a stick on a bare floor) can't show a stretch: check by eye
+        return None
+    scores = {}
     for sx in (0.85, 0.92, 1.0, 1.08, 1.15):
-        for zoom in (1.0, 1.06, 1.12, 1.18, 1.24):
+        for zoom in np.arange(1.0, 1.31, 0.03):  # fine steps: a coarse grid matched a zoom-in as a stretch
             k = h / src.shape[0] * zoom
             img = cv2.resize(src, (max(1, int(src.shape[1] * k * sx)), max(1, int(src.shape[0] * k))))
             if img.shape[0] < tpl.shape[0] or img.shape[1] < tpl.shape[1]:
                 continue
             score = float(cv2.matchTemplate(img, tpl, cv2.TM_CCOEFF_NORMED).max())
-            if score > best[0]:
-                best = (score, sx)
-    return best[1] if best[0] > 0.45 else None
+            scores[sx] = max(score, scores.get(sx, -1.0))
+    if not scores or max(scores.values()) <= 0.45:
+        return None
+    best = max(scores, key=scores.get)
+    # Call a stretch only when it clearly beats the uniform scale; on low-texture frames the scores tie.
+    if scores.get(1.0, -1.0) >= scores[best] - 0.02:
+        return 1.0
+    return best
+
+
+def _rel_lum(v: float) -> float:
+    c = v / 255.0
+    return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def caption_box(frame: np.ndarray) -> dict | None:
+    """The caption box in the caption band, if one is there: its background and text luma and the
+    contrast ratio between them. None when there's no box with text (no dark run holding bright text)."""
+    g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    h, w = g.shape
+    band = g[int(h * CAPTION_BAND[0]):int(h * CAPTION_BAND[1]), int(w * 0.08):int(w * 0.92)]
+    dark = band < 45
+    rows = np.where(dark.mean(axis=1) > 0.30)[0]   # rows that are mostly box
+    if len(rows) < 3:
+        return None
+    box = band[rows.min():rows.max() + 1]
+    cols = np.where((box < 45).mean(axis=0) > 0.30)[0]
+    if len(cols) < band.shape[1] * 0.15:
+        return None
+    box = box[:, cols.min():cols.max() + 1]
+    text = box[box > 150]
+    if text.size < box.size * 0.01:
+        return None
+    bg = float(np.median(box[box < 60])) if (box < 60).any() else float(box.min())
+    fg = float(np.percentile(text, 90))
+    contrast = (_rel_lum(fg) + 0.05) / (_rel_lum(bg) + 0.05)
+    return {"bg": bg, "fg": fg, "contrast": contrast}
 
 
 def faces_at(frames: list[np.ndarray], fps: float) -> list[float]:
@@ -188,10 +229,10 @@ def check_reel(video: Path, images: list[Path], clips: dict[int, Path], credits_
     # --- Render -------------------------------------------------------------------------------------
     lumas = [_luma(f) for f in frames]
     skip = int(FADE_IN_SECONDS * fps) + 1
-    sampled = sorted(set(range(skip, len(frames), max(1, int(fps / 4)))) | {len(frames) - 1})  # + the very last frame
-    black = [round(i / fps, 2) for i in sampled if lumas[i] < BLACK_LUMA]
+    # Every frame after the fade-in, the last one included (0.25 s sampling missed a 1-frame black at a cut).
+    black = [round(i / fps, 2) for i in range(skip, len(frames)) if lumas[i] < BLACK_LUMA]
     checks.append(Check("Render", "no black or empty frames after the fade-in", "FAIL" if black else "PASS",
-                        f"black at {black[:6]} s" if black else "checked every 0.25 s"))
+                        f"black at {black[:6]} s" if black else "checked every frame"))
     dips = []
     for c in cuts:
         a, b = lumas[max(0, c - 4)], lumas[min(len(lumas) - 1, c + 4)]
@@ -200,8 +241,24 @@ def check_reel(video: Path, images: list[Path], clips: dict[int, Path], credits_
             dips.append(round(c / fps, 2))
     checks.append(Check("Render", "transitions are straight cuts, no dip to black", "FAIL" if dips else "PASS",
                         f"dips at {dips} s" if dips else f"{len(cuts)} cuts checked"))
-    checks.append(Check("Render", "captions on a near-solid dark box, white or yellow", "PASS",
-                        "renderer style: 85% black box, white words, yellow highlight"))
+    # Every spoken line has a caption on screen: from the first caption to the end, on every frame
+    # (sampling every 0.25 s missed a 2-3 frame caption flicker at a cut).
+    boxes = {i: caption_box(frames[i]) for i in range(skip, len(frames))}
+    first = next((i for i, b in boxes.items() if b), None)
+    missing_cap = [round(i / fps, 2) for i, b in boxes.items() if first is not None and i >= first and not b]
+    if first is None:
+        checks.append(Check("Render", "every spoken line has a visible caption", "FAIL", "no caption found at all"))
+    else:
+        checks.append(Check("Render", "every spoken line has a visible caption", "FAIL" if missing_cap else "PASS",
+                            f"no readable caption at {missing_cap[:8]} s" if missing_cap else
+                            f"caption on screen in all {sum(1 for i in boxes if i >= first)} frames from {first / fps:.2f} s"))
+    found = [b for b in boxes.values() if b]
+    low = [round(i / fps, 2) for i, b in boxes.items() if b and (b["contrast"] < MIN_CONTRAST or b["bg"] > 50)]
+    worst = min((b["contrast"] for b in found), default=0)
+    checks.append(Check("Render", "captions on a near-solid dark box, readable on bright frames",
+                        "FAIL" if low or not found else "PASS",
+                        f"low contrast or see-through box at {low[:8]} s (worst {worst:.1f}:1)" if low else
+                        f"worst contrast {worst:.1f}:1 (need {MIN_CONTRAST}:1), box background never above 50/255"))
     tail = frames[-int(HOLD_SECONDS * fps):]
     tail_cut = [c for c in cuts if c >= len(frames) - int(HOLD_SECONDS * fps)]
     band = [float(cv2.cvtColor(f[int(f.shape[0] * 0.70):int(f.shape[0] * 0.78)], cv2.COLOR_BGR2GRAY).min()) for f in tail]
