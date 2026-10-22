@@ -44,6 +44,7 @@ CLIP_EXTS = (".mp4", ".mov", ".webm")
 MOTIONS = ["zoom-in", "pan-left", "zoom-out", "pan-right"]
 LONG_EDGE = 1920
 TARGET_LUFS = -14.0
+TRUE_PEAK_MAX = -1.0  # dBTP, measured on the encoded file
 SILENT_LUFS = -50.0
 AI_LABEL = "AI-generated"
 FONT_CANDIDATES = [
@@ -251,6 +252,14 @@ def loudness(path: Path) -> float | None:
     return float(found[-1]) if found else None
 
 
+def true_peak(path: Path) -> float | None:
+    """True peak (dBTP) of the file's audio, as encoded."""
+    proc = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(path), "-af", "ebur128=peak=true", "-f",
+                           "null", "-"], capture_output=True, text=True, timeout=300)
+    found = re.findall(r"Peak:\s+(-?[\d.]+|-inf) dBFS", proc.stderr)
+    return float(found[-1]) if found and found[-1] != "-inf" else None
+
+
 def finish(raw: Path, out: Path, ai_label: bool) -> None:
     """The final file: the AI label burned in top left (when asked) and the audio at -14 LUFS. The
     renderer already ends on the last photo with its caption, and fades the music out with the video."""
@@ -261,18 +270,41 @@ def finish(raw: Path, out: Path, ai_label: bool) -> None:
         vf.append(f"drawtext={font_arg}text='{AI_LABEL}':fontsize=54:fontcolor=white:box=1:"
                   "boxcolor=black@0.6:boxborderw=10:x=44:y=282")
     lufs = loudness(raw)
-    af = []
-    if lufs is not None and lufs > SILENT_LUFS:  # never boost a silent (captions-only) track
-        af = [f"volume={TARGET_LUFS - lufs:.2f}dB", "alimiter=limit=0.84:level=false"]
+    gain = TARGET_LUFS - lufs if lufs is not None and lufs > SILENT_LUFS else None  # never boost a silent track
+    audio = shape_audio(raw, gain, out.with_suffix(".audio.m4a")) if gain is not None and _has_audio(raw) else None
     cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(raw)]
+    if audio:
+        cmd += ["-i", str(audio), "-map", "0:v", "-map", "1:a"]
     if vf:
         cmd += ["-vf", ",".join(vf)]
-    cmd += ["-c:v", "libx264", "-preset", "slow", "-crf", "18", "-pix_fmt", "yuv420p"]
-    if af and _has_audio(raw):
-        cmd += ["-af", ",".join(af), "-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
-    else:
-        cmd += ["-c:a", "copy"]
-    subprocess.run(cmd + ["-movflags", "+faststart", str(out)], check=True, capture_output=True, timeout=900)
+    cmd += ["-c:v", "libx264", "-preset", "slow", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "copy"]
+    try:
+        subprocess.run(cmd + ["-movflags", "+faststart", str(out)], check=True, capture_output=True, timeout=900)
+    finally:
+        if audio:
+            audio.unlink(missing_ok=True)
+
+
+def shape_audio(raw: Path, gain: float, dest: Path) -> Path:
+    """The final AAC track at -14 LUFS with the true peak at -1 dBTP or below. The AAC encoder overshoots
+    bright, dense music by a few dB, so this measures the encoded track and retries with a lower limiter
+    ceiling (and the gain to make up the loudness), audio only, so each try takes seconds."""
+    limit_db = -1.5
+    for _ in range(10):
+        af = [f"volume={gain:.2f}dB", "aresample=192000",  # oversampled, so the limiter sees inter-sample peaks
+              f"alimiter=limit={10 ** (limit_db / 20):.3f}:attack=1:release=30:level=false", "aresample=48000"]
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(raw), "-vn", "-af", ",".join(af),
+                        "-c:a", "aac", "-b:a", "192k", "-ar", "48000", str(dest)],
+                       check=True, capture_output=True, timeout=300)
+        tp, now = true_peak(dest), loudness(dest)
+        tp_ok = tp is None or tp <= TRUE_PEAK_MAX
+        if tp_ok and (now is None or abs(now - TARGET_LUFS) <= 0.5):
+            break
+        if not tp_ok:
+            limit_db -= tp - TRUE_PEAK_MAX + 0.3
+        if now is not None:
+            gain += TARGET_LUFS - now
+    return dest
 
 
 def _has_audio(path: Path) -> bool:

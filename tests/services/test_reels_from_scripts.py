@@ -227,3 +227,20 @@ def test_stretch_check_hands_a_plain_background_to_the_eye(tmp_path):
     cv2.imwrite(str(path), src)
     frame = cv2.cvtColor(cv2.resize(src, (270, 480)), cv2.COLOR_GRAY2BGR)
     assert preflight.stretch_of(frame, path) in (None, 1.0)
+
+
+def test_finish_keeps_the_true_peak_at_or_below_minus_one(tmp_path):
+    """A loud, bright track (the kind AAC overshoots) comes out at -1 dBTP or below after finish()."""
+    import shutil
+    import subprocess
+
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg not installed")
+    raw = tmp_path / "raw.mp4"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=gray:s=108x192:d=3",
+                    "-f", "lavfi", "-i", "anoisesrc=d=3:c=white:a=0.9", "-shortest", "-c:v", "libx264",
+                    "-c:a", "aac", str(raw)], check=True)
+    out = tmp_path / "out.mp4"
+    rfs.finish(raw, out, ai_label=False)
+    tp = rfs.true_peak(out)
+    assert tp is not None and tp <= rfs.TRUE_PEAK_MAX
