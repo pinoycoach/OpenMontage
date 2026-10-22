@@ -266,6 +266,7 @@ def probe(path: Path) -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
+    global AI_LABEL
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("scripts", type=Path, help="file with one '## <slug>' section per reel")
     ap.add_argument("reels", type=Path, help="folder with one sub-folder of images per reel")
@@ -276,9 +277,11 @@ def main(argv: list[str] | None = None) -> int:
     # 0.15 left the bed about 31 dB under the voice (silent once the voice stops); 0.5 sits ~20 dB under.
     ap.add_argument("--music-volume", type=float, default=0.5, help="music bed level, ducked under the voice [0.5]")
     ap.add_argument("--ai-label", action="store_true", help='burn in the "AI-generated" tag (AI voice or visuals)')
+    ap.add_argument("--ai-label-text", default=AI_LABEL, help=f'wording of the tag [{AI_LABEL}]')
     ap.add_argument("--max-words", type=int, default=MAX_WORDS, help=f"word limit per script [{MAX_WORDS}]")
     ap.add_argument("--only", nargs="*", help="render only these reels")
     args = ap.parse_args(argv)
+    AI_LABEL = args.ai_label_text.replace("'", "").replace(":", "")  # drawtext quoting
 
     try:
         reels = parse_scripts(args.scripts.read_text(encoding="utf-8"), args.max_words)
