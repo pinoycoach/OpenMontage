@@ -74,7 +74,9 @@ FAL_USD_PER_SECOND = {
     "fal-ai/flashtalk": 0.02,
     "fal-ai/kling-video/v3/standard/image-to-video": 0.14,
     "fal-ai/kling-video/v2.5-turbo/standard/image-to-video": 0.042,
-    "minimax/h3-max/reference-to-video": 0.05,  # live fal price, 23 Oct 2026 (promo ends 7 Nov)
+    # 768P, the fal model page on 23 Oct 2026 (480P is 0.05, 1080P 0.16). One reference image stays
+    # inside the free 4,096 reference tokens.
+    "minimax/h3-max/reference-to-video": 0.08,
 }
 FAL_FALLBACK_USD_PER_SECOND = {"talking": 0.02, "motion": 0.14}
 # Estimate: one Demucs job, flat (a full 15-minute episode at about $0.0007 per second).
@@ -169,8 +171,8 @@ class RenderRequest(BaseModel):
     talkingScenes: list[int] = Field(default_factory=list, max_length=MAX_TALKING_SCENES)
     # Scenes (0-based) whose image is animated into a short video clip.
     motionScenes: list[int] = Field(default_factory=list, max_length=MAX_H3_MOTION_SCENES)
-    # "kling": up to MAX_MOTION_SCENES scenes from their image alone. "h3": H3 Max with the next
-    # scene's image as the end keyframe, up to MAX_H3_MOTION_SCENES scenes.
+    # "kling": up to MAX_MOTION_SCENES scenes. "h3": H3 Max, up to MAX_H3_MOTION_SCENES scenes.
+    # Both animate each scene from its own image alone.
     motionEngine: Literal["kling", "h3"] = "kling"
     # Floating particles over the whole video (part of a visual style).
     particles: Optional[Particles] = None
@@ -686,34 +688,27 @@ H3_DEFAULT_PROMPT = ("One continuous cinematic shot with a slow, smooth camera m
                      "people and colours the same. No text.")
 
 
-def h3_motion_clip(image: Path, end_image: Optional[Path], prompt: Optional[str], seconds: float, out: Path,
+def h3_motion_clip(image: Path, prompt: Optional[str], seconds: float, out: Path,
                    deadline: float, aspect_ratio: str = "9:16") -> Path:
-    """Animate a scene with fal H3 Max: it opens on `image` and, when given, ends exactly on `end_image`
-    (the next scene's picture, so the cut into it is seamless). Retimed to exactly `seconds`."""
-    def still(src: Path, name: str) -> str:
-        dst = out.with_name(f"{out.stem}-{name}.jpg")
-        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(src),
-                        "-vf", "scale='min(1080,iw)':-2", "-q:v", "3", str(dst)],
-                       check=True, capture_output=True, timeout=60)
-        return _fal_file_url(dst, "image/jpeg")
-
-    start_url = still(image, "start")
-    end_url = still(end_image, "end") if end_image else None
+    """Animate a scene with fal H3 Max: it opens on `image` and moves for the whole clip. Retimed to
+    exactly `seconds`. No end keyframe: given one, H3 doesn't move into it, it hard-cuts to it partway
+    through (1.1-2.3 s into a 2-3 s clip, measured 23 Oct 2026), which put the next scene's picture
+    under the current caption. The next scene's own clip opens on that picture anyway."""
+    still = out.with_name(f"{out.stem}-start.jpg")
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(image),
+                    "-vf", "scale='min(1080,iw)':-2", "-q:v", "3", str(still)],
+                   check=True, capture_output=True, timeout=60)
+    start_url = _fal_file_url(still, "image/jpeg")
     duration = min(15, max(2, math.ceil(seconds)))
-    scene = (prompt or "").strip() or H3_DEFAULT_PROMPT
-    text = (f"Image 1 is the first frame; Image 2 is the last frame. {scene} "
-            "Move smoothly from Image 1 to Image 2 in one shot, no cuts.") if end_url else scene
     body = {
-        "prompt": text,
+        "prompt": (prompt or "").strip() or H3_DEFAULT_PROMPT,
         "image_url": start_url,
-        "reference_image_urls": [start_url] + ([end_url] if end_url else []),  # H3 needs at least one
+        "reference_image_urls": [start_url],  # H3 needs at least one
         "duration": duration,
         "resolution": "768P",
         "aspect_ratio": aspect_ratio,
         "prompt_expansion_mode": "balanced",
     }
-    if end_url:
-        body["end_image_url"] = end_url
     result = _fal_paid("motion", FAL_H3_MOTION_MODEL, body, deadline, duration)
     raw = _download(result["video"]["url"], out.with_name(out.stem + "-raw.mp4"))
     factor = seconds / (probe_duration(raw) or duration)
@@ -739,14 +734,9 @@ def add_motion_scenes(props: dict, req: RenderRequest, job_dir: Path, image_path
     deadline = time.monotonic() + MOTION_TIMEOUT_SECONDS
     moved = 0
 
-    def end_frame(i: int) -> Optional[Path]:
-        """The next scene's image, the H3 end keyframe; none after the last scene or before a card."""
-        nxt = i + 1
-        return image_paths[nxt] if nxt < len(req.scenes) and not req.scenes[nxt].card else None
-
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(wanted), MOTION_WORKERS)) as pool:
         futures = {
-            (pool.submit(h3_motion_clip, image_paths[i], end_frame(i), req.scenes[i].motionPrompt,
+            (pool.submit(h3_motion_clip, image_paths[i], req.scenes[i].motionPrompt,
                          cuts[i]["out_seconds"] - cuts[i]["in_seconds"], job_dir / f"motion-{i + 1}.mp4",
                          deadline, req.aspectRatio)
              if h3 else

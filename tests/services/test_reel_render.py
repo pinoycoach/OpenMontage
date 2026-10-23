@@ -457,19 +457,15 @@ class TestCardsAndMotion:
         props = rr.build_props(req, paths, None, None)
         calls = []
 
-        def fake_h3(image, end_image, prompt, seconds, out, deadline, aspect):
-            calls.append((image.name, end_image.name if end_image else None, aspect))
+        def fake_h3(image, prompt, seconds, out, deadline, aspect):
+            calls.append((image.name, aspect))
             out.write_bytes(b"mp4")
             return out
 
         monkeypatch.setattr(rr, "h3_motion_clip", fake_h3)
         assert rr.add_motion_scenes(props, req, tmp_path, paths) == 4  # the card scene never moves
-        assert sorted(calls) == [
-            ("scene-1.png", "scene-2.png", "9:16"),
-            ("scene-2.png", "scene-3.png", "9:16"),
-            ("scene-3.png", None, "9:16"),  # the next scene is a card
-            ("scene-5.png", None, "9:16"),  # the last scene has no next image
-        ]
+        assert sorted(calls) == [("scene-1.png", "9:16"), ("scene-2.png", "9:16"),
+                                 ("scene-3.png", "9:16"), ("scene-5.png", "9:16")]
 
     def test_kling_motion_stays_capped_at_two_scenes(self, tmp_path: Path, monkeypatch):
         monkeypatch.setattr(rr, "FAL_KEY", "k")
@@ -484,12 +480,11 @@ class TestCardsAndMotion:
         with pytest.raises(ValueError):
             _request(motionEngine="sora")
 
-    def test_h3_motion_clip_sends_keyframes_and_retimes(self, tmp_path: Path, monkeypatch):
+    def test_h3_motion_clip_sends_start_frame_only_and_retimes(self, tmp_path: Path, monkeypatch):
         import subprocess
         monkeypatch.setattr(rr, "FAL_KEY", "k")
-        for name, colour in (("scene-1.png", "red"), ("scene-2.png", "green")):
-            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", f"color=c={colour}:s=320x568",
-                            "-frames:v", "1", str(tmp_path / name)], check=True)
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=red:s=320x568",
+                        "-frames:v", "1", str(tmp_path / "scene-1.png")], check=True)
         clip = tmp_path / "h3.mp4"
         subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=blue:s=320x568:d=3",
                         "-pix_fmt", "yuv420p", str(clip)], check=True)
@@ -502,21 +497,20 @@ class TestCardsAndMotion:
         monkeypatch.setattr(rr, "_fal_run", fake_run)
         monkeypatch.setattr(rr, "_fal_file_url", lambda path, mime: f"https://cdn/{path.name}")
         monkeypatch.setattr(rr, "_download", lambda url, out: out.write_bytes(clip.read_bytes()) and out)
-        out = rr.h3_motion_clip(tmp_path / "scene-1.png", tmp_path / "scene-2.png", "Walls rise", 2.4,
+        out = rr.h3_motion_clip(tmp_path / "scene-1.png", "Walls rise", 2.4,
                                 tmp_path / "motion-1.mp4", rr.time.monotonic() + 60, "9:16")
         assert sent["model"] == rr.FAL_H3_MOTION_MODEL
         assert sent["image_url"] == "https://cdn/motion-1-start.jpg"
-        assert sent["end_image_url"] == "https://cdn/motion-1-end.jpg"
-        assert sent["reference_image_urls"] == ["https://cdn/motion-1-start.jpg", "https://cdn/motion-1-end.jpg"]
+        # No end keyframe: H3 hard-cuts to one mid-clip instead of moving into it.
+        assert "end_image_url" not in sent
+        assert sent["reference_image_urls"] == ["https://cdn/motion-1-start.jpg"]
         assert sent["duration"] == 3 and sent["resolution"] == "768P" and sent["aspect_ratio"] == "9:16"
-        assert "Walls rise" in sent["prompt"] and "Image 2" in sent["prompt"]
+        assert sent["prompt"] == "Walls rise"
         assert abs(rr.probe_duration(out) - 2.4) < 0.15
-        assert rr.fal_estimate("motion", rr.FAL_H3_MOTION_MODEL, 3) == 0.15
+        assert rr.fal_estimate("motion", rr.FAL_H3_MOTION_MODEL, 3) == pytest.approx(0.24)
 
         sent.clear()
-        rr.h3_motion_clip(tmp_path / "scene-1.png", None, None, 2.0, tmp_path / "motion-9.mp4",
-                          rr.time.monotonic() + 60)
-        assert "end_image_url" not in sent and sent["reference_image_urls"] == ["https://cdn/motion-9-start.jpg"]
+        rr.h3_motion_clip(tmp_path / "scene-1.png", None, 2.0, tmp_path / "motion-9.mp4", rr.time.monotonic() + 60)
         assert sent["prompt"] == rr.H3_DEFAULT_PROMPT
 
     def test_endpoint_reports_motion_header(self, monkeypatch):
