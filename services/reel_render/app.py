@@ -458,14 +458,21 @@ def build_props(req: RenderRequest, image_paths: list[Path], voice_path: Optiona
     return props
 
 
+# The music bed's loudness at musicVolume 1.0, before ducking. AI tracks (Lyria) arrive mastered loud,
+# so a plain volume cut left the bed louder than the voice in the pauses; levelling it first makes
+# musicVolume mean the same thing for every track (0.5 = -32 LUFS, about 18 dB under a -14 voice).
+MUSIC_BED_LUFS = -26.0
+
+
 def mix_music(voice_path: Optional[Path], music_path: Path, total: float, job_dir: Path,
               volume: float) -> Path:
-    """One soundtrack: the music looped or trimmed to the video, faded in and out, and ducked
-    under the voice (a sidechain compressor lowers it whenever someone speaks)."""
+    """One soundtrack: the music looped or trimmed to the video, levelled to MUSIC_BED_LUFS, faded in
+    and out, and ducked under the voice (a sidechain compressor lowers it whenever someone speaks)."""
     out = job_dir / "soundtrack.wav"
     fmt = "aformat=sample_rates=48000:channel_layouts=stereo"
     fade_out = max(total - 1.0, 0.0)  # a 1 s fade that ends exactly with the video
-    music_chain = (f"[1:a]{fmt},atrim=0:{total:.2f},volume={volume:.3f},"
+    music_chain = (f"[1:a]{fmt},atrim=0:{total:.2f},loudnorm=I={MUSIC_BED_LUFS:.1f}:TP=-2:LRA=11,{fmt},"
+                   f"volume={volume:.3f},"
                    f"afade=t=in:d=1,afade=t=out:st={fade_out:.2f}:d=1")
     if voice_path:
         graph = (f"[0:a]{fmt},apad=whole_dur={total:.2f},asplit=2[voice][key];"
