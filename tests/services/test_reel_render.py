@@ -212,6 +212,30 @@ class TestMusic:
         out = rr.mix_music(None, music, 4.0, tmp_path, 0.5)
         assert abs(rr.probe_duration(out) - 4.0) < 0.1
 
+    def _lufs(self, path: Path) -> float:
+        import re
+        import subprocess
+        proc = subprocess.run(["ffmpeg", "-nostats", "-i", str(path), "-af", "ebur128", "-f", "null", "-"],
+                              capture_output=True, text=True)
+        return float(re.findall(r"I:\s+(-?[\d.]+) LUFS", proc.stderr)[-1])
+
+    def test_music_bed_is_levelled_whatever_its_master(self, tmp_path: Path):
+        import subprocess
+        loud, quiet = tmp_path / "loud.wav", tmp_path / "quiet.wav"
+        for path, gain in ((loud, 0.9), (quiet, 0.05)):
+            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                            "anoisesrc=d=8:c=pink:a=1", "-af", f"volume={gain}", str(path)], check=True)
+        levels = []
+        for music in (loud, quiet):
+            job = tmp_path / music.stem
+            job.mkdir()
+            levels.append(self._lufs(rr.mix_music(None, music, 6.0, job, 1.0)))
+        assert abs(levels[0] - levels[1]) < 2.0
+        assert abs(levels[0] - rr.MUSIC_BED_LUFS) < 2.5
+        # musicVolume 0.5 is about 6 dB under that.
+        half = self._lufs(rr.mix_music(None, loud, 6.0, tmp_path, 0.5))
+        assert 4.5 < levels[0] - half < 7.5
+
     def test_endpoint_accepts_music(self, monkeypatch, tmp_path: Path):
         monkeypatch.setattr(rr, "RENDER_TOKEN", "secret")
         seen = {}
