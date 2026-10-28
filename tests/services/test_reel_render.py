@@ -983,3 +983,16 @@ class TestFinishing:
         assert rr.finish_headers({"aiLabel": True, "lufs": None, "truePeak": None}) == {"X-Ai-Label": "1"}
         assert rr.finish_headers({"aiLabel": False, "lufs": -13.96, "truePeak": -1.04}) == {
             "X-Ai-Label": "0", "X-Loudness-Lufs": "-14.0", "X-True-Peak-Dbtp": "-1.0"}
+
+
+# 28 Oct 2026: with PyAV 19, faster-whisper's decoder calls av.open(..., metadata_errors=...) and gets a
+# TypeError, so transcribe() returned None and every reel's captions fell back to estimated timing.
+def test_faster_whisper_can_decode_audio(tmp_path):
+    import subprocess
+
+    from faster_whisper.audio import decode_audio
+
+    wav = tmp_path / "tone.wav"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=1", str(wav)], check=True)
+    samples = decode_audio(str(wav))
+    assert 15000 < len(samples) < 17000  # 1 s at 16 kHz
