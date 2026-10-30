@@ -244,3 +244,30 @@ def test_finish_keeps_the_true_peak_at_or_below_minus_one(tmp_path):
     rfs.finish(raw, out, ai_label=False)
     tp = rfs.true_peak(out)
     assert tp is not None and tp <= rfs.TRUE_PEAK_MAX
+
+
+def _tiny_reel(tmp_path):
+    """Two 1 s stills with silent audio, as a finished reel would be."""
+    import subprocess
+    imgs = []
+    for i, v in enumerate([90, 180]):
+        p = tmp_path / f"s{i}.png"
+        cv2.imwrite(str(p), np.full((1920, 1080, 3), v, np.uint8))
+        imgs.append(p)
+    video = tmp_path / "reel.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-loop", "1", "-t", "1", "-i", str(imgs[0]), "-loop", "1", "-t", "1",
+                    "-i", str(imgs[1]), "-f", "lavfi", "-t", "2", "-i", "anullsrc=r=48000:cl=stereo",
+                    "-filter_complex", "[0][1]concat=n=2:v=1:a=0,fps=24,format=yuv420p[v]", "-map", "[v]", "-map", "2:a",
+                    "-c:v", "libx264", "-c:a", "aac", "-shortest", str(video)], check=True)
+    return video, imgs
+
+
+# Video desk, 28 Oct: a hand edit with a silent shot on purpose got an automatic PASS on "3+ script words".
+def test_three_words_check_is_by_ear_unless_the_script_split_made_the_reel(tmp_path):
+    video, imgs = _tiny_reel(tmp_path)
+    line = lambda checks: next(c for c in checks if c.item == "each image has 3+ script words")  # noqa: E731
+    edit = preflight.check_reel(video, imgs, {}, "", has_voice=False, has_music=False, sheet=tmp_path / "a.jpg")
+    assert line(edit).status == "MANUAL"
+    split = preflight.check_reel(video, imgs, {}, "", has_voice=False, has_music=False, sheet=tmp_path / "b.jpg",
+                                 script_split=True)
+    assert line(split).status == "PASS"

@@ -49,7 +49,13 @@ covered too). A body that isn't JSON at all gets `422` before the token is check
 `GET /health` is a health check. Cloud Run reserves paths ending in "z", so `/healthz` only works
 locally. `CAPTION_SYNC=off` turns off the speech timing.
 
-Run locally from the repo root:
+Run locally from the repo root. Install the renderer's own pinned requirements into the `.venv` first: a
+plain `pip install opencv-python-headless` pulls OpenCV 5 (no `cv2.CascadeClassifier`, so the preflight
+crashes), and an unpinned PyAV 19 breaks faster-whisper (captions fall back to estimated timing):
+
+```bash
+.venv/bin/pip install -r services/reel_render/requirements.txt
+```
 
 ```bash
 RENDER_TOKEN=dev .venv/bin/uvicorn services.reel_render.app:app --port 8090
