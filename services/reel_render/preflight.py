@@ -14,7 +14,9 @@ import cv2
 import numpy as np
 
 BLACK_LUMA = 8          # a frame darker than this (mean, 0-255) counts as black
-FADE_IN_SECONDS = 0.3   # the only place a dark frame is allowed
+FADE_IN_SECONDS = 0.0   # no fade-in any more: frame 1 must be a picture (renderer PR #23)
+HOOK_TEXT_SECONDS = 0.5  # short-form rule: text on screen within half a second
+FRAME1_MIN_RATIO = 0.8   # frame 1 at least 80% as bright as the shot at 0.5 s (no fade-in)
 DIP_RATIO = 0.5         # at a cut, a frame darker than half of both neighbours is a dip
 CUT_DIFF = 20           # mean frame difference (0-255, small frames) that marks a scene change
 LUFS_TARGET, LUFS_TOL = -14.0, 1.0
@@ -232,11 +234,17 @@ def check_reel(video: Path, images: list[Path], clips: dict[int, Path], credits_
 
     # --- Render -------------------------------------------------------------------------------------
     lumas = [_luma(f) for f in frames]
-    skip = int(FADE_IN_SECONDS * fps) + 1
-    # Every frame after the fade-in, the last one included (0.25 s sampling missed a 1-frame black at a cut).
+    skip = int(FADE_IN_SECONDS * fps)  # 0: frame 1 is checked too
+    # Every frame, frame 1 and the last one included (0.25 s sampling missed a 1-frame black at a cut).
     black = [round(i / fps, 2) for i in range(skip, len(frames)) if lumas[i] < BLACK_LUMA]
-    checks.append(Check("Render", "no black or empty frames after the fade-in", "FAIL" if black else "PASS",
+    checks.append(Check("Render", "no black or empty frames, frame 1 included", "FAIL" if black else "PASS",
                         f"black at {black[:6]} s" if black else "checked every frame"))
+    # The hook: frame 1 is the picture itself, not a fade up from dark (a fade from dark navy is above
+    # BLACK_LUMA, so the black check alone misses it). Compare frame 1 with the same shot at 0.5 s.
+    ref = lumas[min(len(lumas) - 1, int(HOOK_TEXT_SECONDS * fps))] if lumas else 0.0
+    faded = bool(lumas) and ref > BLACK_LUMA and lumas[0] < FRAME1_MIN_RATIO * ref
+    checks.append(Check("Render", "frame 1 is the picture, no fade-in", "FAIL" if faded else "PASS",
+                        f"frame 1 brightness {lumas[0]:.0f} vs {ref:.0f} at {HOOK_TEXT_SECONDS} s" if lumas else "no frames"))
     dips = []
     for c in cuts:
         a, b = lumas[max(0, c - 4)], lumas[min(len(lumas) - 1, c + 4)]
@@ -256,6 +264,10 @@ def check_reel(video: Path, images: list[Path], clips: dict[int, Path], credits_
         checks.append(Check("Render", "every spoken line has a visible caption", "FAIL" if missing_cap else "PASS",
                             f"no readable caption at {missing_cap[:8]} s" if missing_cap else
                             f"caption on screen in all {sum(1 for i in boxes if i >= first)} frames from {first / fps:.2f} s"))
+    # The hook: viewers decide in the first second, so the hook text is on screen by 0.5 s.
+    late = first is None or first / fps > HOOK_TEXT_SECONDS
+    checks.append(Check("Render", f"hook text on screen by {HOOK_TEXT_SECONDS} s", "FAIL" if late else "PASS",
+                        "no caption found" if first is None else f"first caption at {first / fps:.2f} s"))
     found = [b for b in boxes.values() if b]
     low = [round(i / fps, 2) for i, b in boxes.items() if b and (b["contrast"] < MIN_CONTRAST or b["bg"] > 50)]
     worst = min((b["contrast"] for b in found), default=0)
