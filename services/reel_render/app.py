@@ -878,20 +878,25 @@ def video_response(path: Path, filename: str, headers: Optional[dict] = None) ->
 
 
 def ping_pong_clip(raw: bytes, ext: str, seconds: float, stem: Path) -> Path:
-    """A loop reel's clip: played forward, then backward, repeated to fill the scene, so its last frame
-    is its first and the platform's replay shows no jump (the Hermit card's Omni push-in snapped back
-    from close-up to wide on 30 Oct). The sender records seconds / 2n of the clip for this."""
+    """A loop reel's clip: played forward, then backward, repeated to fill the scene, so its end runs on
+    into its start and the platform's replay shows no jump (the Hermit card's Omni push-in snapped back
+    from close-up to wide on 30 Oct). The sender records about seconds / 2n of the clip; a recording runs
+    a few frames long or short, so the clip is retimed to exactly half a there-and-back first (a card
+    recorded 0.2 s long ended a loop on the wrong frame, 31 Oct). One there-and-back is frames 0..m-1
+    then m-2..1, so the next one starts on frame 0 with no repeated frame."""
     src = stem.with_suffix(ext or ".mp4")
     src.write_bytes(raw)
     have = probe_duration(src) or 0.0
     if have <= 0.1:
         raise HTTPException(400, "That scene clip can't be read.")
     out = stem.parent / f"{stem.name}-pingpong.mp4"
-    # Counted in frames at a fixed 30 fps, so a there-and-back of seconds / 2 fills the scene exactly
-    # and its last frame is the first one again.
-    frames = max(1, round(seconds * 30))
+    frames = max(4, round(seconds * 30))
+    trips = max(1, round(seconds / (2 * have)))
+    m = max(2, round(frames / (2 * trips)) + 1)  # frames in the forward half, both ends included
+    stretch = m / 30 / have
     proc = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(src), "-an", "-filter_complex",
-                           "[0:v]fps=30,split[f][b];[b]reverse,trim=start_frame=1,setpts=PTS-STARTPTS[r];"
+                           f"[0:v]setpts={stretch:.6f}*PTS,fps=30,trim=end_frame={m},setpts=PTS-STARTPTS,split[f][b];"
+                           f"[b]reverse,trim=start_frame=1:end_frame={m - 1},setpts=PTS-STARTPTS[r];"
                            "[f][r]concat=n=2:v=1,loop=loop=-1:size=32767,"
                            f"trim=end_frame={frames},setpts=PTS-STARTPTS[v]",
                            "-map", "[v]", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(out)],
