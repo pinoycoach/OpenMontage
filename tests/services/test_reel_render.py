@@ -996,3 +996,13 @@ def test_faster_whisper_can_decode_audio(tmp_path):
     subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=1", str(wav)], check=True)
     samples = decode_audio(str(wav))
     assert 15000 < len(samples) < 17000  # 1 s at 16 kHz
+
+
+class TestVignette:
+    def test_on_by_default(self, tmp_path: Path):
+        props = rr.build_props(_request(), [tmp_path / "a.png"] * 2, None, None)
+        assert all("vignette" not in c for c in props["cuts"])
+
+    def test_off_for_a_paper_card(self, tmp_path: Path):
+        props = rr.build_props(_request(vignette=False), [tmp_path / "a.png"] * 2, None, None)
+        assert [c["vignette"] for c in props["cuts"]] == [False, False]
