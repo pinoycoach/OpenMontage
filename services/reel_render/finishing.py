@@ -74,13 +74,29 @@ def has_audio(path: Path) -> bool:
     return bool(out.strip())
 
 
-def shape_audio(raw: Path, gain: float, dest: Path, target_lufs: float = TARGET_LUFS) -> Path:
+def audio_lead(path: Path, longest: float = 0.25) -> float:
+    """The silence at the very start of the file's audio, up to `longest` seconds. Remotion's render starts
+    its audio with about 40 ms of it, which a loop reel hears as a gap on every replay (30 Oct 2026); a
+    loop's own music never starts silent (its end is blended into its start)."""
+    proc = subprocess.run(["ffmpeg", "-nostats", "-t", f"{longest + 0.5:.2f}", "-i", str(path), "-vn", "-af",
+                           "silencedetect=noise=-60dB:d=0.005", "-f", "null", "-"],
+                          capture_output=True, text=True, timeout=60)
+    starts = re.findall(r"silence_start: (-?[\d.]+)", proc.stderr)
+    ends = re.findall(r"silence_end: ([\d.]+)", proc.stderr)
+    if not starts or not ends or float(starts[0]) > 0.001:
+        return 0.0
+    lead = float(ends[0])
+    return round(lead, 3) if lead <= longest else 0.0
+
+
+def shape_audio(raw: Path, gain: float, dest: Path, target_lufs: float = TARGET_LUFS, lead: float = 0.0) -> Path:
     """The final AAC track at the target loudness with the true peak at -1 dBTP or below. The AAC encoder
     overshoots bright, dense music by a few dB, so this measures the encoded track and retries with a lower
     limiter ceiling (and the gain to make up the loudness), audio only, so each try takes seconds."""
     limit_db = -1.5
     for _ in range(10):
-        af = [f"volume={gain:.2f}dB", "aresample=192000",  # oversampled, so the limiter sees inter-sample peaks
+        af = [*([f"atrim=start={lead:.3f}", "asetpts=PTS-STARTPTS"] if lead > 0 else []),
+              f"volume={gain:.2f}dB", "aresample=192000",  # oversampled, so the limiter sees inter-sample peaks
               f"alimiter=limit={10 ** (limit_db / 20):.3f}:attack=1:release=30:level=false", "aresample=48000"]
         subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(raw), "-vn", "-af", ",".join(af),
                         "-c:a", "aac", "-b:a", "192k", "-ar", "48000", str(dest)],
@@ -97,17 +113,19 @@ def shape_audio(raw: Path, gain: float, dest: Path, target_lufs: float = TARGET_
 
 
 def finish(raw: Path, out: Path, ai_label: bool, normalize: bool = True, target_lufs: float = TARGET_LUFS,
-           preset: str = "slow", label_text: str = AI_LABEL) -> dict:
+           preset: str = "slow", label_text: str = AI_LABEL, trim_lead: bool = False) -> dict:
     """The final file: the AI label burned in top left (when asked) and the audio at the target loudness
     (when asked, and the track isn't silent). Returns what was done and the final measurements:
     {"aiLabel": bool, "lufs": float | None, "truePeak": float | None}; the measurements are None when the
-    audio was left as it was (so nothing extra is measured) or the file has no audio."""
+    audio was left as it was (so nothing extra is measured) or the file has no audio. trim_lead (loop reels)
+    drops the silence the render puts before the audio, so the replay has no gap."""
     vf = [label_filter(find_font(), label_text)] if ai_label else []
     audio = None
     if normalize and has_audio(raw):
         lufs = loudness(raw)
         if lufs is not None and lufs > SILENT_LUFS:  # never boost a silent (captions-only) track
-            audio = shape_audio(raw, target_lufs - lufs, out.with_suffix(".audio.m4a"), target_lufs)
+            audio = shape_audio(raw, target_lufs - lufs, out.with_suffix(".audio.m4a"), target_lufs,
+                                lead=audio_lead(raw) if trim_lead else 0.0)
     cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(raw)]
     if audio:
         cmd += ["-i", str(audio), "-map", "0:v", "-map", "1:a"]

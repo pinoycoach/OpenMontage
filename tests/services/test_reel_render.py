@@ -1043,3 +1043,96 @@ class TestCaptionPosition:
     def test_rejects_an_unknown_position(self):
         with pytest.raises(Exception):
             _request(scenes=[{"image": PNG_URL, "durationSeconds": 2, "captionPosition": "middle"}])
+
+
+class TestLoop:
+    def _samples(self, path: Path):
+        import subprocess
+        import numpy as np
+        raw = subprocess.run(["ffmpeg", "-loglevel", "error", "-i", str(path), "-ac", "1", "-ar", "48000",
+                              "-f", "f32le", "-"], capture_output=True, check=True).stdout
+        return np.frombuffer(raw, dtype=np.float32)
+
+    def test_off_by_default_keeps_the_fade_in_and_the_hold(self, tmp_path: Path):
+        props = rr.build_props(_request(), [tmp_path / "a.png"] * 2, None, None)
+        assert props["cuts"][0]["transition_in"] == "fade"
+        assert props["cuts"][-1]["out_seconds"] == round(5 + rr.LAST_LINE_HOLD, 3)
+
+    def test_loop_starts_without_a_fade_and_ends_without_a_hold(self, tmp_path: Path):
+        props = rr.build_props(_request(loop=True), [tmp_path / "a.png"] * 2, None, None)
+        assert [c["transition_in"] for c in props["cuts"]] == ["cut", "cut"]
+        assert props["cuts"][-1]["out_seconds"] == 5.0
+
+    def test_breathe_is_a_camera_move(self):
+        req = _request(scenes=[{"image": PNG_URL, "durationSeconds": 8, "cameraMotion": "breathe"}])
+        assert req.scenes[0].cameraMotion == "breathe"
+
+    def test_loop_music_has_no_fades_and_runs_on_into_its_start(self, tmp_path: Path):
+        import subprocess
+        import numpy as np
+        music = tmp_path / "m.wav"  # a steady chord: any fade or gap shows as a drop in level
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                        "sine=frequency=220:duration=12", "-f", "lavfi", "-i", "sine=frequency=330:duration=12",
+                        "-filter_complex", "amix=inputs=2", str(music)], check=True)
+        out = rr.mix_music(None, music, 8.0, tmp_path, 1.0, loop=True)
+        x = self._samples(out)
+        assert abs(len(x) / 48000 - 8.0) < 0.02
+        rms = lambda a: float(np.sqrt(np.mean(a ** 2)))
+        start, end, middle = rms(x[:2400]), rms(x[-2400:]), rms(x[len(x) // 2: len(x) // 2 + 2400])
+        # No fade-in at the start or fade-out at the end: both edges are as loud as the middle.
+        assert start > 0.7 * middle and end > 0.7 * middle
+        # Played twice, the seam has no click: the step across it is no bigger than a normal step.
+        twice = np.concatenate([x, x])
+        seam = abs(twice[len(x)] - twice[len(x) - 1])
+        typical = np.percentile(np.abs(np.diff(x)), 99)
+        assert seam <= typical * 1.5
+
+    def test_plain_music_still_fades(self, tmp_path: Path):
+        import subprocess
+        import numpy as np
+        music = tmp_path / "m.wav"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                        "sine=frequency=220:duration=12", str(music)], check=True)
+        x = self._samples(rr.mix_music(None, music, 8.0, tmp_path, 1.0))
+        rms = lambda a: float(np.sqrt(np.mean(a ** 2)))
+        assert rms(x[:480]) < 0.3 * rms(x[len(x) // 2: len(x) // 2 + 2400])
+
+    def test_ping_pong_clip_ends_where_it_starts(self, tmp_path: Path):
+        import subprocess
+        src = tmp_path / "src.mp4"  # 1 s of moving test pattern
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                        "testsrc2=size=320x568:rate=30:duration=1", "-pix_fmt", "yuv420p", str(src)], check=True)
+        # The sender records half the scene (seconds / 2n), so a whole number of there-and-backs fills it.
+        out = rr.ping_pong_clip(src.read_bytes(), ".mp4", 2.0, tmp_path / "clip-1")
+        assert abs(rr.probe_duration(out) - 2.0) < 0.1
+
+        def frame_at(n: int, name: str) -> Path:
+            path = tmp_path / name
+            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(out), "-vf", f"select=eq(n\\,{n})",
+                            "-frames:v", "1", str(path)], check=True)
+            return path
+
+        def psnr(a: Path, b: Path) -> float:
+            import re
+            proc = subprocess.run(["ffmpeg", "-i", str(a), "-i", str(b), "-lavfi", "psnr", "-f", "null", "-"],
+                                  capture_output=True, text=True)
+            value = re.findall(r"average:(\S+)", proc.stderr)[-1]
+            return float("inf") if value == "inf" else float(value)
+
+        first, last, turn = frame_at(0, "a.png"), frame_at(59, "b.png"), frame_at(29, "c.png")  # 60 frames
+        assert psnr(first, last) > 30  # back where it started: the replay has no jump
+        assert psnr(first, turn) < 25  # and it really moved in between
+
+    def test_audio_lead_finds_the_silence_before_the_sound(self, tmp_path: Path):
+        import subprocess
+        from services.reel_render import finishing
+        clip = tmp_path / "a.mp4"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=gray:s=64x64:d=1",
+                        "-f", "lavfi", "-i", "sine=frequency=220:duration=1", "-filter_complex", "[1:a]adelay=40|40[a]",
+                        "-map", "0:v", "-map", "[a]", "-c:v", "libx264", "-c:a", "pcm_s16le", str(tmp_path / "a.mov")],
+                       check=True)
+        assert abs(finishing.audio_lead(tmp_path / "a.mov") - 0.04) < 0.01
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=gray:s=64x64:d=1",
+                        "-f", "lavfi", "-i", "sine=frequency=220:duration=1", "-c:v", "libx264", "-c:a", "pcm_s16le",
+                        str(tmp_path / "b.mov")], check=True)
+        assert finishing.audio_lead(tmp_path / "b.mov") == 0.0
