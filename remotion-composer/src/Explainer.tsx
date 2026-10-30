@@ -349,12 +349,14 @@ const Vignette: React.FC = () => (
 const ImageScene: React.FC<{
   src: string;
   animation?: string;
+  // The dark edges; off for a light, paper-style card.
+  vignette?: boolean;
   // Same meaning as on video cuts: "cut"/"none" = hard cut, "fade" = linear fade over transitionDuration.
   // Unset keeps the default spring fade-in and the dim at the end.
   transitionIn?: string;
   transitionOut?: string;
   transitionDuration?: number;
-}> = ({ src, animation, transitionIn, transitionOut, transitionDuration }) => {
+}> = ({ src, animation, vignette = true, transitionIn, transitionOut, transitionDuration }) => {
   const frame = useCurrentFrame();
   const { fps, durationInFrames } = useVideoConfig();
   const inMode = (transitionIn || "").toLowerCase();
@@ -423,7 +425,7 @@ const ImageScene: React.FC<{
           willChange: "transform, opacity",
         }}
       />
-      <Vignette />
+      {vignette && <Vignette />}
     </AbsoluteFill>
   );
 };
@@ -435,6 +437,7 @@ const ImageScene: React.FC<{
 const VideoScene: React.FC<{
   src: string;
   startFrom?: number;
+  vignette?: boolean;
   transitionIn?: string;
   transitionOut?: string;
   transitionDuration?: number;
@@ -443,6 +446,7 @@ const VideoScene: React.FC<{
 }> = ({
   src,
   startFrom = 0,
+  vignette = true,
   transitionIn,
   transitionOut,
   transitionDuration,
@@ -486,7 +490,7 @@ const VideoScene: React.FC<{
         }}
         muted
       />
-      <Vignette />
+      {vignette && <Vignette />}
     </AbsoluteFill>
   );
 };
@@ -770,6 +774,7 @@ const SceneRenderer: React.FC<{ cut: Cut; theme: ThemeConfig }> = ({ cut, theme 
       <ImageScene
         src={cut.source}
         animation={animation}
+        vignette={cut.vignette ?? true}
         transitionIn={cut.transition_in}
         transitionOut={cut.transition_out}
         transitionDuration={cut.transition_duration}
@@ -782,6 +787,7 @@ const SceneRenderer: React.FC<{ cut: Cut; theme: ThemeConfig }> = ({ cut, theme 
       <VideoScene
         src={cut.source}
         startFrom={cut.source_in_seconds ?? 0}
+        vignette={cut.vignette ?? true}
         transitionIn={cut.transition_in}
         transitionOut={cut.transition_out}
         transitionDuration={cut.transition_duration}

@@ -172,6 +172,9 @@ class RenderRequest(BaseModel):
     # audio at -14 LUFS with the true peak at -1 dBTP or below. Off only for a reel with nothing AI in it.
     aiLabel: bool = True
     normalizeAudio: bool = True
+    # The dark edges the composer draws over image and video scenes. Off for a light, paper-style card
+    # (Character Studio's quote cards), where they read as grey dirt in the corners.
+    vignette: bool = True
 
 
 OPEN_PATHS = {"/health", "/healthz"}
@@ -399,6 +402,8 @@ def build_props(req: RenderRequest, image_paths: list[Path], voice_path: Optiona
             "transition_out": "cut",
             "transition_duration": FIRST_FADE_IN,
         }
+        if not req.vignette:
+            cut["vignette"] = False
         if scene.card:
             cut["type"] = "reel_card"
             cut["card"] = scene.card.model_dump(exclude_none=True)
