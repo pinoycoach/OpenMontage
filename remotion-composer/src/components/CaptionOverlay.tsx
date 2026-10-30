@@ -16,6 +16,9 @@ export interface WordCaption {
   // Force a page break after this word (e.g. sentence or scene boundaries).
   // Useful for CJK captions where pages should align with clause boundaries.
   pageBreakAfter?: boolean;
+  // Show this word's page near the top (topOffset) instead of the bottom. A page takes its first word's
+  // place, so a renderer marks every word of a scene the same way.
+  high?: boolean;
 }
 
 type CaptionOverlayProps = {
@@ -32,6 +35,8 @@ type CaptionOverlayProps = {
   wordSeparator?: string;
   // Distance from the bottom edge in px. Vertical reels want captions above the app UI.
   bottomOffset?: number;
+  // Distance from the top edge in px for pages marked `high`.
+  topOffset?: number;
   /** Keep the last page on screen until this time (ms), e.g. the end of the video. */
   holdLastPageUntilMs?: number;
   /** Show each page at full opacity at once (no fade/slide in), so it is readable on any frame. */
@@ -73,8 +78,9 @@ const PageRenderer: React.FC<{
   fontFamily: string;
   wordSeparator: string;
   bottomOffset: number;
+  topOffset: number;
   instant: boolean;
-}> = ({ page, fontSize, color, highlightColor, backgroundColor, fontFamily, wordSeparator, bottomOffset, instant }) => {
+}> = ({ page, fontSize, color, highlightColor, backgroundColor, fontFamily, wordSeparator, bottomOffset, topOffset, instant }) => {
   const frame = useCurrentFrame();
   const { fps } = useVideoConfig();
 
@@ -89,18 +95,21 @@ const PageRenderer: React.FC<{
         config: { damping: 18, stiffness: 120 },
       });
 
+  const high = !!page.words[0]?.high;
+
   return (
     <AbsoluteFill
-      style={{
-        justifyContent: "flex-end",
-        alignItems: "center",
-        paddingBottom: bottomOffset,
-      }}
+      style={
+        high
+          ? { justifyContent: "flex-start", alignItems: "center", paddingTop: topOffset }
+          : { justifyContent: "flex-end", alignItems: "center", paddingBottom: bottomOffset }
+      }
     >
       <div
         style={{
           opacity: entrance,
-          transform: `translateY(${interpolate(entrance, [0, 1], [20, 0])}px)`,
+          // A high page slides down into place, a low one up.
+          transform: `translateY(${interpolate(entrance, [0, 1], [high ? -20 : 20, 0])}px)`,
           backgroundColor,
           borderRadius: 12,
           padding: "14px 28px",
@@ -158,6 +167,7 @@ export const CaptionOverlay: React.FC<CaptionOverlayProps> = ({
   fontFamily = "Space Grotesk, Inter, system-ui, sans-serif",
   wordSeparator = " ",
   bottomOffset = 80,
+  topOffset = 120,
   holdLastPageUntilMs,
   instant = false,
 }) => {
@@ -184,6 +194,7 @@ export const CaptionOverlay: React.FC<CaptionOverlayProps> = ({
               fontFamily={fontFamily}
               wordSeparator={wordSeparator}
               bottomOffset={bottomOffset}
+              topOffset={topOffset}
               instant={instant}
             />
           </Sequence>

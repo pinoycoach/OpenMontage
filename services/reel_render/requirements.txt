@@ -4,5 +4,6 @@ fastapi==0.143.2
 uvicorn==0.54.0
 pydantic==2.14.1
 faster-whisper==1.2.1  # times captions to the actual speech
+av==18.1.0  # faster-whisper's audio decoder; PyAV 19 dropped av.open(metadata_errors=...), so every transcription failed
 opencv-python-headless==4.14.0.94  # finds the speaker's face when reframing clips to vertical (stay on 4.x)
 numpy==2.2.6  # dub pitch and subtitle search (also needed by faster-whisper and OpenCV)

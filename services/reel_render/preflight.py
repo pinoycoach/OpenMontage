@@ -180,9 +180,11 @@ def contact_sheet(frames: list[np.ndarray], fps: float, out: Path, per_second: i
 
 
 def check_reel(video: Path, images: list[Path], clips: dict[int, Path], credits_text: str,
-               has_voice: bool, has_music: bool, sheet: Path) -> list[Check]:
+               has_voice: bool, has_music: bool, sheet: Path, script_split: bool = False) -> list[Check]:
     """Run the checklist on one finished reel. `images` in scene order; `clips` maps scene index to a
-    supplied motion clip (those scenes are matched against the clip's first frame instead)."""
+    supplied motion clip (those scenes are matched against the clip's first frame instead).
+    `script_split`: the reel was cut by reels_from_scripts.split_script, which gives every image 3+ words;
+    any other reel (a hand edit, a silent shot on purpose) gets that check by ear."""
     checks: list[Check] = []
     frames, fps = _frames(video)
     info = probe(video)
@@ -226,7 +228,9 @@ def check_reel(video: Path, images: list[Path], clips: dict[int, Path], credits_
                         f"face detector hits at {faces} s: look there first" if faces else "detector found none; still look"))
     checks.append(Check("Inputs", "no AI-invented text on signs, gauges or paint", "MANUAL" if clips else "PASS",
                         f"look at the motion scenes {sorted(k + 1 for k in clips)}" if clips else "no AI motion in this reel"))
-    checks.append(Check("Inputs", "each image has 3+ script words", "PASS", "enforced when the script is split"))
+    checks.append(Check("Inputs", "each image has 3+ script words", "PASS" if script_split else "MANUAL",
+                        "enforced when the script is split" if script_split
+                        else "not cut by the script split: check by ear (a silent shot on purpose is fine)"))
 
     # --- Render -------------------------------------------------------------------------------------
     lumas = [_luma(f) for f in frames]
