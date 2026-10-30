@@ -83,6 +83,10 @@ FPS = 30
 
 CameraMotion = Literal["zoom-in", "zoom-out", "pan-left", "pan-right", "subtle-pulse"]
 CaptionStyle = Literal["yellow-pop", "neon-cyan", "minimal-white"]
+# Where a scene's captions sit: "low" above the Reels/TikTok buttons (the default), or "high", just
+# under the "AI-generated" label, for a shot whose subject fills the lower half (Character Studio's
+# ghost-dog punchline on 30 Oct 2026 was hidden behind its own caption).
+CaptionPosition = Literal["low", "high"]
 Particles = Literal["fireflies", "petals", "sparkles", "mist", "light-rays"]
 
 # Explainer understands zoom/pan directly; the app's "subtle-pulse" is closest to ken-burns.
@@ -147,6 +151,7 @@ class Scene(BaseModel):
     # A ready-made clip for this scene (video data URL, e.g. an approved AI shot). It plays instead of
     # the image; when it's shorter than the scene, its last frame is held so the frame never goes empty.
     video: Optional[str] = None
+    captionPosition: CaptionPosition = "low"
 
 
 class RenderRequest(BaseModel):
@@ -357,6 +362,9 @@ def timed_spans(word_ranges: list[tuple[int, int]], times: list[tuple[float, flo
     return spans
 
 
+CAPTION_TOP_OFFSET = 400
+
+
 def caption_line(scene: Scene, has_voice: bool) -> str:
     # With narration, captions follow what is spoken; otherwise show the on-screen text.
     return (scene.voiceoverLine if has_voice else None) or scene.captionOverlay or ""
@@ -410,6 +418,7 @@ def build_props(req: RenderRequest, image_paths: list[Path], voice_path: Optiona
         cuts.append(cut)
         words = lines[i]
         breaks = page_breaks(len(words), per_page)
+        first = len(captions)
         if req.captions and exact:
             for n, word in enumerate(words):
                 t0, t1 = exact[word_index + n]
@@ -417,6 +426,10 @@ def build_props(req: RenderRequest, image_paths: list[Path], voice_path: Optiona
                                  "pageBreakAfter": n in breaks})
         elif req.captions:
             captions.extend(word_captions(" ".join(words), start, end, per_page))
+        # A scene's last word always ends a page, so every page belongs to one scene and takes its place.
+        if scene.captionPosition == "high":
+            for word in captions[first:]:
+                word["high"] = True
         word_index += len(words)
 
     props: dict = {
@@ -436,6 +449,8 @@ def build_props(req: RenderRequest, image_paths: list[Path], voice_path: Optiona
         # The composer's hard limit; page_breaks() already splits lines (short lines stay whole up to +2).
         "captionWordsPerPage": per_page + 2,
         "captionBottomOffset": 460 if vertical else 90,
+        # A "high" page's top edge: under the "AI-generated" label, which ends near y 345 on vertical.
+        "captionTopOffset": CAPTION_TOP_OFFSET if vertical else 90,
         "themeConfig": {
             "backgroundColor": "#000000",
             "surfaceColor": "#000000",
