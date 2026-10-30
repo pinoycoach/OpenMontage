@@ -392,6 +392,10 @@ const ImageScene: React.FC<{
 
   if (anim === "zoom-in") {
     scale = 1 + progress * 0.18;
+  } else if (anim === "breathe") {
+    // In and back out, easing at both ends: the last frame matches the first, so a loop reel replays
+    // without a jump (Character Studio's loop cards).
+    scale = 1 + 0.09 * (1 - Math.cos(2 * Math.PI * progress));
   } else if (anim === "zoom-out") {
     scale = 1.18 - progress * 0.18;
   } else if (anim === "pan-left") {

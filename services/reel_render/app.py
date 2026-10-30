@@ -81,7 +81,7 @@ MAX_SCENES = 30
 MAX_ASSET_BYTES = 25 * 1024 * 1024
 FPS = 30
 
-CameraMotion = Literal["zoom-in", "zoom-out", "pan-left", "pan-right", "subtle-pulse"]
+CameraMotion = Literal["zoom-in", "zoom-out", "pan-left", "pan-right", "subtle-pulse", "breathe"]
 CaptionStyle = Literal["yellow-pop", "neon-cyan", "minimal-white"]
 # Where a scene's captions sit: "low" above the Reels/TikTok buttons (the default), or "high", just
 # under the "AI-generated" label, for a shot whose subject fills the lower half (Character Studio's
@@ -180,6 +180,10 @@ class RenderRequest(BaseModel):
     # The dark edges the composer draws over image and video scenes. Off for a light, paper-style card
     # (Character Studio's quote cards), where they read as grey dirt in the corners.
     vignette: bool = True
+    # A reel made to replay seamlessly on the platform (Character Studio's loop cards, 30 Oct 2026): no
+    # fade-in from black, no hold at the end, and music cut to the exact length with its end blended
+    # into its start (no fades), so the replay shows no restart. Every other reel is unchanged.
+    loop: bool = False
 
 
 OPEN_PATHS = {"/health", "/healthz"}
@@ -392,7 +396,7 @@ def build_props(req: RenderRequest, image_paths: list[Path], voice_path: Optiona
             if exact_spans:
                 spans, exact = exact_spans, times
 
-    if not exact and spans and not req.endCard:  # an end card follows instead
+    if not exact and spans and not req.endCard and not req.loop:  # an end card follows instead
         start, end = spans[-1]
         spans[-1] = (start, round(end + LAST_LINE_HOLD, 3))
 
@@ -406,7 +410,7 @@ def build_props(req: RenderRequest, image_paths: list[Path], voice_path: Optiona
             "in_seconds": start,
             "out_seconds": end,
             "animation": MOTION_MAP.get(motion, motion),
-            "transition_in": "fade" if i == 0 else "cut",
+            "transition_in": "fade" if i == 0 and not req.loop else "cut",
             "transition_out": "cut",
             "transition_duration": FIRST_FADE_IN,
         }
@@ -484,16 +488,51 @@ def build_props(req: RenderRequest, image_paths: list[Path], voice_path: Optiona
 MUSIC_BED_LUFS = -26.0
 
 
+# A loop reel's music: the half second after the cut is blended (equal power) into the first half
+# second, so the end of the track runs straight on into its start when the platform replays it.
+LOOP_BLEND_SECONDS = 0.5
+
+
+def loop_music(music_path: Path, total: float, job_dir: Path, volume: float) -> Path:
+    """The music for a loop reel, exactly `total` long: levelled like any bed, then the blend after the
+    cut mixed into the start (equal power), so its end runs straight on into its start. Two ffmpeg
+    steps: one graph that splits a stream and waits on its own tail stalled and went silent."""
+    fmt = "aformat=sample_rates=48000:channel_layouts=stereo"
+    blend = min(LOOP_BLEND_SECONDS, total / 4)
+    levelled = job_dir / "music-levelled.wav"
+    out = job_dir / "music-loop.wav"
+    steps = [
+        ["ffmpeg", "-y", "-loglevel", "error", "-stream_loop", "-1", "-i", str(music_path), "-af",
+         f"{fmt},atrim=0:{total + blend:.3f},loudnorm=I={MUSIC_BED_LUFS:.1f}:TP=-2:LRA=11,{fmt},volume={volume:.3f}",
+         "-t", f"{total + blend:.3f}", str(levelled)],
+        ["ffmpeg", "-y", "-loglevel", "error", "-i", str(levelled), "-i", str(levelled), "-filter_complex",
+         f"[0:a]atrim=0:{total:.3f},asetpts=PTS-STARTPTS,afade=t=in:d={blend:.3f}:curve=qsin[start];"
+         f"[1:a]atrim={total:.3f}:{total + blend:.3f},asetpts=PTS-STARTPTS,afade=t=out:d={blend:.3f}:curve=qsin[end];"
+         "[start][end]amix=inputs=2:duration=first:normalize=0[out]",
+         "-map", "[out]", str(out)],
+    ]
+    for cmd in steps:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        if proc.returncode != 0:
+            raise HTTPException(500, f"Loop music failed: {proc.stderr[-500:]}")
+    return out
+
+
 def mix_music(voice_path: Optional[Path], music_path: Path, total: float, job_dir: Path,
-              volume: float) -> Path:
+              volume: float, loop: bool = False) -> Path:
     """One soundtrack: the music looped or trimmed to the video, levelled to MUSIC_BED_LUFS, faded in
-    and out, and ducked under the voice (a sidechain compressor lowers it whenever someone speaks)."""
+    and out (or, for a loop reel, blended end into start), and ducked under the voice (a sidechain
+    compressor lowers it whenever someone speaks)."""
     out = job_dir / "soundtrack.wav"
     fmt = "aformat=sample_rates=48000:channel_layouts=stereo"
     fade_out = max(total - 1.0, 0.0)  # a 1 s fade that ends exactly with the video
-    music_chain = (f"[1:a]{fmt},atrim=0:{total:.2f},loudnorm=I={MUSIC_BED_LUFS:.1f}:TP=-2:LRA=11,{fmt},"
-                   f"volume={volume:.3f},"
-                   f"afade=t=in:d=1,afade=t=out:st={fade_out:.2f}:d=1")
+    if loop:
+        music_path = loop_music(music_path, total, job_dir, volume)
+        music_chain = f"[1:a]{fmt},atrim=0:{total:.3f}"
+    else:
+        music_chain = (f"[1:a]{fmt},atrim=0:{total:.2f},loudnorm=I={MUSIC_BED_LUFS:.1f}:TP=-2:LRA=11,{fmt},"
+                       f"volume={volume:.3f},"
+                       f"afade=t=in:d=1,afade=t=out:st={fade_out:.2f}:d=1")
     if voice_path:
         graph = (f"[0:a]{fmt},apad=whole_dur={total:.2f},asplit=2[voice][key];"
                  f"{music_chain}[music];"
@@ -784,6 +823,30 @@ def video_response(path: Path, filename: str, headers: Optional[dict] = None) ->
         **(headers or {})})
 
 
+def ping_pong_clip(raw: bytes, ext: str, seconds: float, stem: Path) -> Path:
+    """A loop reel's clip: played forward, then backward, repeated to fill the scene, so its last frame
+    is its first and the platform's replay shows no jump (the Hermit card's Omni push-in snapped back
+    from close-up to wide on 30 Oct). The sender records seconds / 2n of the clip for this."""
+    src = stem.with_suffix(ext or ".mp4")
+    src.write_bytes(raw)
+    have = probe_duration(src) or 0.0
+    if have <= 0.1:
+        raise HTTPException(400, "That scene clip can't be read.")
+    out = stem.parent / f"{stem.name}-pingpong.mp4"
+    # Counted in frames at a fixed 30 fps, so a there-and-back of seconds / 2 fills the scene exactly
+    # and its last frame is the first one again.
+    frames = max(1, round(seconds * 30))
+    proc = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(src), "-an", "-filter_complex",
+                           "[0:v]fps=30,split[f][b];[b]reverse,trim=start_frame=1,setpts=PTS-STARTPTS[r];"
+                           "[f][r]concat=n=2:v=1,loop=loop=-1:size=32767,"
+                           f"trim=end_frame={frames},setpts=PTS-STARTPTS[v]",
+                           "-map", "[v]", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(out)],
+                          capture_output=True, text=True, timeout=300)
+    if proc.returncode != 0 or not out.exists():
+        raise HTTPException(400, f"That scene clip can't be looped: {proc.stderr[-300:]}")
+    return out
+
+
 def fit_clip(raw: bytes, ext: str, seconds: float, stem: Path) -> Path:
     """Save a supplied scene clip; when it's shorter than the scene, hold its last frame to fill it."""
     src = stem.with_suffix(ext or ".mp4")
@@ -828,7 +891,7 @@ def finish_reel(raw: Path, req: RenderRequest, job_dir: Path) -> tuple[Path, dic
     if not (req.aiLabel or req.normalizeAudio):
         return raw, {}
     out = job_dir / "final.mp4"
-    return out, finishing.finish(raw, out, ai_label=req.aiLabel, normalize=req.normalizeAudio)
+    return out, finishing.finish(raw, out, ai_label=req.aiLabel, normalize=req.normalizeAudio, trim_lead=req.loop)
 
 
 def finish_headers(info: dict) -> dict:
@@ -881,7 +944,9 @@ def render_reel(req: RenderRequest, background: BackgroundTasks) -> StreamingRes
             if scene.video:
                 raw, ext = decode_data_url(scene.video, "video/")
                 cut = props["cuts"][i]
-                clip = fit_clip(raw, ext, cut["out_seconds"] - cut["in_seconds"], job_dir / f"clip-{i + 1}")
+                seconds = cut["out_seconds"] - cut["in_seconds"]
+                stem = job_dir / f"clip-{i + 1}"
+                clip = ping_pong_clip(raw, ext, seconds, stem) if req.loop else fit_clip(raw, ext, seconds, stem)
                 cut["source"] = clip.name
         # Taken before fal is called, so a request that is turned away has paid for nothing.
         if not _render_lock.acquire(timeout=LOCK_WAIT_SECONDS):
@@ -895,7 +960,7 @@ def render_reel(req: RenderRequest, background: BackgroundTasks) -> StreamingRes
                 talked, moved = talking_job.result(), motion_job.result()
             if music_path:
                 total = max(c["out_seconds"] for c in props["cuts"]) + TAIL_SECONDS
-                soundtrack = mix_music(voice_path, music_path, total, job_dir, req.musicVolume)
+                soundtrack = mix_music(voice_path, music_path, total, job_dir, req.musicVolume, req.loop)
                 props["audio"]["narration"] = {"src": soundtrack.name, "volume": 1}
             if req.sfx:
                 narration = props["audio"].get("narration")
