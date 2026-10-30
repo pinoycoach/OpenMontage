@@ -99,6 +99,9 @@ class TestBuildProps:
         props = rr.build_props(req, imgs, tmp_path / "voiceover.wav", 4.0)
         assert [c["source"] for c in props["cuts"]] == ["scene-1.png", "scene-2.png"]
         assert [c["animation"] for c in props["cuts"]] == ["zoom-in", "ken-burns"]
+        # Frame 1 is a picture, not a fade from black: every cut, the first included, is a hard cut.
+        assert [(c["transition_in"], c["transition_out"]) for c in props["cuts"]] == [("cut", "cut"), ("cut", "cut")]
+        assert "transition_duration" not in props["cuts"][0]
         assert props["audio"]["narration"]["src"] == "voiceover.wav"
         # With narration, captions follow the spoken line.
         assert props["captions"][0]["word"] == "Stop"
@@ -1053,9 +1056,9 @@ class TestLoop:
                               "-f", "f32le", "-"], capture_output=True, check=True).stdout
         return np.frombuffer(raw, dtype=np.float32)
 
-    def test_off_by_default_keeps_the_fade_in_and_the_hold(self, tmp_path: Path):
+    def test_off_by_default_keeps_the_hold(self, tmp_path: Path):
         props = rr.build_props(_request(), [tmp_path / "a.png"] * 2, None, None)
-        assert props["cuts"][0]["transition_in"] == "fade"
+        assert props["cuts"][0]["transition_in"] == "cut"  # no reel fades in (PR #23)
         assert props["cuts"][-1]["out_seconds"] == round(5 + rr.LAST_LINE_HOLD, 3)
 
     def test_loop_starts_without_a_fade_and_ends_without_a_hold(self, tmp_path: Path):

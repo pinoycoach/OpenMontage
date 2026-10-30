@@ -134,8 +134,9 @@ END_CARD_SECONDS = 2.5
 TAIL_SECONDS = 0.0
 # Without word timings, the last scene runs this long past its last caption word, so the line can be read.
 LAST_LINE_HOLD = 0.5
-# Straight cuts between scenes (no dip to black); only the first scene fades in, quickly.
-FIRST_FADE_IN = 0.3
+# Straight cuts everywhere, the first scene included: a fade-in on frame 1 is a blank opening frame,
+# and short-form viewers decide in the first second (skills/creative/short-form.md: movement and text
+# in frame 1, no fade-in). The composer's default is a spring fade-in, so "cut" has to be explicit.
 
 
 class Scene(BaseModel):
@@ -181,8 +182,8 @@ class RenderRequest(BaseModel):
     # (Character Studio's quote cards), where they read as grey dirt in the corners.
     vignette: bool = True
     # A reel made to replay seamlessly on the platform (Character Studio's loop cards, 30 Oct 2026): no
-    # fade-in from black, no hold at the end, and music cut to the exact length with its end blended
-    # into its start (no fades), so the replay shows no restart. Every other reel is unchanged.
+    # hold at the end, clips there and back, and music cut to the exact length with its end blended into
+    # its start (no fades), so the replay shows no restart. (No reel fades in from black any more.)
     loop: bool = False
 
 
@@ -410,9 +411,8 @@ def build_props(req: RenderRequest, image_paths: list[Path], voice_path: Optiona
             "in_seconds": start,
             "out_seconds": end,
             "animation": MOTION_MAP.get(motion, motion),
-            "transition_in": "fade" if i == 0 and not req.loop else "cut",
+            "transition_in": "cut",
             "transition_out": "cut",
-            "transition_duration": FIRST_FADE_IN,
         }
         if not req.vignette:
             cut["vignette"] = False
