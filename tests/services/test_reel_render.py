@@ -1165,31 +1165,38 @@ class TestLoop:
         rms = lambda a: float(np.sqrt(np.mean(a ** 2)))
         assert rms(x[:480]) < 0.3 * rms(x[len(x) // 2: len(x) // 2 + 2400])
 
-    def test_ping_pong_clip_ends_where_it_starts(self, tmp_path: Path):
+    def _ping_pong(self, tmp_path: Path, source_seconds: float, name: str):
         import subprocess
-        src = tmp_path / "src.mp4"  # 1 s of moving test pattern
+        src = tmp_path / f"{name}.mp4"  # moving test pattern
         subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i",
-                        "testsrc2=size=320x568:rate=30:duration=1", "-pix_fmt", "yuv420p", str(src)], check=True)
-        # The sender records half the scene (seconds / 2n), so a whole number of there-and-backs fills it.
-        out = rr.ping_pong_clip(src.read_bytes(), ".mp4", 2.0, tmp_path / "clip-1")
-        assert abs(rr.probe_duration(out) - 2.0) < 0.1
+                        f"testsrc2=size=320x568:rate=30:duration={source_seconds}", "-pix_fmt", "yuv420p", str(src)],
+                       check=True)
+        return rr.ping_pong_clip(src.read_bytes(), ".mp4", 2.0, tmp_path / name)
 
-        def frame_at(n: int, name: str) -> Path:
-            path = tmp_path / name
-            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(out), "-vf", f"select=eq(n\\,{n})",
-                            "-frames:v", "1", str(path)], check=True)
-            return path
+    def _frame(self, video: Path, n: int, path: Path) -> Path:
+        import subprocess
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(video), "-vf", f"select=eq(n\\,{n})",
+                        "-frames:v", "1", str(path)], check=True)
+        return path
 
-        def psnr(a: Path, b: Path) -> float:
-            import re
-            proc = subprocess.run(["ffmpeg", "-i", str(a), "-i", str(b), "-lavfi", "psnr", "-f", "null", "-"],
-                                  capture_output=True, text=True)
-            value = re.findall(r"average:(\S+)", proc.stderr)[-1]
-            return float("inf") if value == "inf" else float(value)
+    def _psnr(self, a: Path, b: Path) -> float:
+        import re
+        import subprocess
+        proc = subprocess.run(["ffmpeg", "-i", str(a), "-i", str(b), "-lavfi", "psnr", "-f", "null", "-"],
+                              capture_output=True, text=True)
+        value = re.findall(r"average:(\S+)", proc.stderr)[-1]
+        return float("inf") if value == "inf" else float(value)
 
-        first, last, turn = frame_at(0, "a.png"), frame_at(59, "b.png"), frame_at(29, "c.png")  # 60 frames
-        assert psnr(first, last) > 30  # back where it started: the replay has no jump
-        assert psnr(first, turn) < 25  # and it really moved in between
+    def test_ping_pong_clip_runs_on_into_its_start(self, tmp_path: Path):
+        # 1 s exactly, and a recording that ran 0.2 s long (the Hermit card, 31 Oct): both fill 2 s
+        # with one there-and-back that ends on frame 1, so the replay's frame 0 follows on smoothly.
+        for source, name in ((1.0, "exact"), (1.2, "long"), (0.85, "short")):
+            out = self._ping_pong(tmp_path, source, name)
+            assert abs(rr.probe_duration(out) - 2.0) < 0.05, name
+            f = lambda n, tag: self._frame(out, n, tmp_path / f"{name}-{tag}.png")
+            first, second, last, turn = f(0, "a"), f(1, "b"), f(59, "c"), f(30, "d")
+            assert self._psnr(last, second) > 30, name  # the last frame is frame 1: no jump at the replay
+            assert self._psnr(first, turn) < 25, name  # and it really moved in between
 
     def test_audio_lead_finds_the_silence_before_the_sound(self, tmp_path: Path):
         import subprocess
