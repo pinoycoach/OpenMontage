@@ -1006,3 +1006,40 @@ class TestVignette:
     def test_off_for_a_paper_card(self, tmp_path: Path):
         props = rr.build_props(_request(vignette=False), [tmp_path / "a.png"] * 2, None, None)
         assert [c["vignette"] for c in props["cuts"]] == [False, False]
+
+
+class TestCaptionPosition:
+    def _scenes(self, second: str = "low"):
+        return [
+            {"image": PNG_URL, "durationSeconds": 2, "voiceoverLine": "Stop scrolling now", "captionOverlay": "Stop scrolling now"},
+            {"image": PNG_URL, "durationSeconds": 3, "voiceoverLine": "Here is why", "captionOverlay": "Here is why",
+             "captionPosition": second},
+        ]
+
+    def test_low_by_default(self, tmp_path: Path):
+        props = rr.build_props(_request(), [tmp_path / "a.png"] * 2, None, None)
+        assert props["captions"] and all("high" not in w for w in props["captions"])
+        assert props["captionTopOffset"] == rr.CAPTION_TOP_OFFSET
+
+    def test_high_scene_marks_only_its_words(self, tmp_path: Path):
+        props = rr.build_props(_request(scenes=self._scenes("high")), [tmp_path / "a.png"] * 2, None, None)
+        assert [w["word"] for w in props["captions"] if w.get("high")] == ["Here", "is", "why"]
+        assert not any(w.get("high") for w in props["captions"][:3])
+
+    def test_high_with_speech_timing(self, tmp_path: Path):
+        heard = [("Stop", 0.0, 0.3), ("scrolling", 0.3, 0.8), ("now.", 0.8, 1.1),
+                 ("Here", 1.6, 1.8), ("is", 1.8, 1.9), ("why.", 1.9, 2.3)]
+        props = rr.build_props(_request(scenes=self._scenes("high")), [tmp_path / "a.png"] * 2,
+                               tmp_path / "v.wav", 2.6, heard)
+        assert props["captionTiming"] == "speech"
+        assert [w.get("high", False) for w in props["captions"]] == [False] * 3 + [True] * 3
+        # The high scene's first word starts a new page, so no page mixes the two places.
+        assert props["captions"][2]["pageBreakAfter"] is True
+
+    def test_high_clears_the_ai_label(self):
+        from services.reel_render import finishing
+        assert rr.CAPTION_TOP_OFFSET > finishing.LABEL_Y + finishing.LABEL_FONT_SIZE + 20
+
+    def test_rejects_an_unknown_position(self):
+        with pytest.raises(Exception):
+            _request(scenes=[{"image": PNG_URL, "durationSeconds": 2, "captionPosition": "middle"}])

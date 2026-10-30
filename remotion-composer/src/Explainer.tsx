@@ -923,6 +923,7 @@ export const Explainer: React.FC<ExplainerProps> = (props) => {
           wordsPerPage={(props.captionWordsPerPage as number) ?? 6}
           fontSize={(props.captionFontSize as number) ?? 42}
           bottomOffset={(props.captionBottomOffset as number) ?? 80}
+          topOffset={(props.captionTopOffset as number) ?? 120}
           color={theme.textColor}
           highlightColor={theme.captionHighlightColor}
           backgroundColor={theme.captionBackgroundColor}
