@@ -336,7 +336,7 @@ def main(argv: list[str] | None = None) -> int:
         from preflight import check_reel  # noqa: E402 - beside this file; needs OpenCV like the renderer
         checks = check_reel(final, images, clips, (folder / "credits.txt").read_text(encoding="utf-8"),
                             has_voice=bool(voice), has_music=bool(music_by_reel[slug]),
-                            sheet=args.out / f"{slug}-sheet-2fps.jpg")
+                            sheet=args.out / f"{slug}-sheet-2fps.jpg", script_split=True)
         fails = [c for c in checks if c.status == "FAIL"]
         preflight_fails += len(fails)
         (args.out / f"{slug}-preflight.txt").write_text(
