@@ -218,6 +218,13 @@ class RenderRequest(BaseModel):
     # hold at the end, clips there and back, and music cut to the exact length with its end blended into
     # its start (no fades), so the replay shows no restart. (No reel fades in from black any more.)
     loop: bool = False
+    # For a master an editor finishes (Character Studio's "Export for the editor", 31 Oct 2026): seconds of
+    # silence before the first spoken word and after the last, on the first and last shots, so the editor
+    # has real frames for a cold open and a sell-card hold.
+    holdSeconds: float = Field(0, ge=0, le=5)
+    # Send back when each spoken word starts and ends (X-Word-Timings: base64 JSON {text, words: [{word,
+    # start, end}]}), from the same alignment the captions use, so the editor needn't transcribe again.
+    wordTimings: bool = False
 
 
 OPEN_PATHS = {"/health", "/healthz"}
@@ -403,6 +410,32 @@ def timed_spans(word_ranges: list[tuple[int, int]], times: list[tuple[float, flo
 CAPTION_TOP_OFFSET = 400
 
 
+def pad_voice(voice: Path, seconds: float, job_dir: Path) -> Path:
+    """The voiceover with `seconds` of silence before and after it (RenderRequest.holdSeconds)."""
+    out = job_dir / "voiceover-held.wav"
+    ms = int(round(seconds * 1000))
+    proc = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(voice), "-af",
+                           f"adelay={ms}:all=1,apad=pad_dur={seconds:.3f}", str(out)],
+                          capture_output=True, text=True, timeout=120)
+    if proc.returncode != 0 or not out.exists():
+        raise HTTPException(500, f"Couldn't add the holds to the voice: {proc.stderr[-300:]}")
+    return out
+
+
+def word_timings(req: "RenderRequest", heard: Optional[list[tuple[str, float, float]]]) -> Optional[dict]:
+    """When each scripted word is spoken: the script lined up with what the transcriber heard (the same
+    alignment the captions use), or what was heard as it is when they don't line up."""
+    if not heard:
+        return None
+    script = [w for s in req.scenes for w in caption_line(s, True).split()]
+    times = align_words(script, heard) if script else None
+    if times:
+        words = [{"word": w, "start": round(a, 3), "end": round(b, 3)} for w, (a, b) in zip(script, times)]
+    else:
+        words = [{"word": w, "start": round(a, 3), "end": round(b, 3)} for w, a, b in heard]
+    return {"text": " ".join(w["word"] for w in words), "words": words}
+
+
 def caption_line(scene: Scene, has_voice: bool) -> str:
     # With narration, captions follow what is spoken; otherwise show the on-screen text.
     return (scene.voiceoverLine if has_voice else None) or scene.captionOverlay or ""
@@ -430,6 +463,10 @@ def build_props(req: RenderRequest, image_paths: list[Path], voice_path: Optiona
             if exact_spans:
                 spans, exact = exact_spans, times
 
+    if exact and spans and req.holdSeconds > 0:
+        # The last shot holds this long after the last word (instead of the usual 0.8 s).
+        start, end = spans[-1]
+        spans[-1] = (start, round(end - 0.8 + max(req.holdSeconds, 0.8), 3))
     if not exact and spans and not req.endCard and not req.loop:  # an end card follows instead
         start, end = spans[-1]
         spans[-1] = (start, round(end + LAST_LINE_HOLD, 3))
@@ -1046,8 +1083,12 @@ def render_reel(req: RenderRequest, background: BackgroundTasks) -> StreamingRes
             music_path = job_dir / f"music{ext}"
             music_path.write_bytes(raw)
 
+        if voice_path and req.holdSeconds > 0:
+            voice_path = pad_voice(voice_path, req.holdSeconds, job_dir)
+            voice_seconds = probe_duration(voice_path)
         heard = transcribe(voice_path) if voice_path else None
         props = build_props(req, image_paths, voice_path, voice_seconds, heard)
+        timings = word_timings(req, heard) if req.wordTimings and voice_path else None
         for i, scene in enumerate(req.scenes):
             cut = props["cuts"][i]
             seconds = cut["out_seconds"] - cut["in_seconds"]
@@ -1099,6 +1140,8 @@ def render_reel(req: RenderRequest, background: BackgroundTasks) -> StreamingRes
         headers["X-Talking-Scenes"] = f"{talked}/{len(set(req.talkingScenes))}"
     if req.motionScenes:
         headers["X-Motion-Scenes"] = f"{moved}/{len(set(req.motionScenes))}"
+    if timings:
+        headers["X-Word-Timings"] = base64.b64encode(json.dumps(timings, ensure_ascii=False).encode()).decode()
     return video_response(out, "reel-hd.mp4", headers)
 
 

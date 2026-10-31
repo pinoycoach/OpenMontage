@@ -1272,3 +1272,37 @@ class TestCardClip:
         turn = frame(out, 30, "t.png")
         assert psnr(turn, frame(src, 29, "s29.png")) > 30
         assert psnr(turn, frame(src, 85, "s85.png")) < 25
+
+
+class TestEditorMaster:
+    HEARD = [("Stop", 2.5, 2.8), ("scrolling", 2.8, 3.3), ("now.", 3.3, 3.6),
+             ("Here", 4.1, 4.3), ("is", 4.3, 4.4), ("why.", 4.4, 4.8)]
+
+    def test_off_by_default(self):
+        req = _request()
+        assert req.holdSeconds == 0 and req.wordTimings is False
+
+    def test_the_last_shot_holds_after_the_last_word(self, tmp_path: Path):
+        plain = rr.build_props(_request(), [tmp_path / "a.png"] * 2, tmp_path / "v.wav", 7.3, self.HEARD)
+        held = rr.build_props(_request(holdSeconds=2.5), [tmp_path / "a.png"] * 2, tmp_path / "v.wav", 7.3, self.HEARD)
+        assert held["captionTiming"] == "speech"
+        assert plain["cuts"][-1]["out_seconds"] == round(4.8 + 0.8, 3)
+        assert held["cuts"][-1]["out_seconds"] == round(4.8 + 2.5, 3)
+        assert held["cuts"][0]["in_seconds"] == 0.0  # the first shot covers the opening silence
+
+    def test_pad_voice_adds_silence_at_both_ends(self, tmp_path: Path):
+        import subprocess
+        voice = tmp_path / "v.wav"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=300:duration=2",
+                        str(voice)], check=True)
+        out = rr.pad_voice(voice, 2.5, tmp_path)
+        assert abs(rr.probe_duration(out) - 7.0) < 0.1
+        from services.reel_render import finishing
+        assert abs(finishing.audio_lead(out, longest=3.0) - 2.5) < 0.05
+
+    def test_word_timings_follow_the_script(self):
+        timings = rr.word_timings(_request(), self.HEARD)
+        assert timings["text"] == "Stop scrolling now Here is why"
+        assert timings["words"][0] == {"word": "Stop", "start": 2.5, "end": 2.8}
+        assert [w["word"] for w in timings["words"]] == ["Stop", "scrolling", "now", "Here", "is", "why"]
+        assert rr.word_timings(_request(), None) is None
