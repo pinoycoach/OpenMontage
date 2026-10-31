@@ -1211,3 +1211,64 @@ class TestLoop:
                         "-f", "lavfi", "-i", "sine=frequency=220:duration=1", "-c:v", "libx264", "-c:a", "pcm_s16le",
                         str(tmp_path / "b.mov")], check=True)
         assert finishing.audio_lead(tmp_path / "b.mov") == 0.0
+
+
+class TestCardClip:
+    def _files(self, tmp_path: Path):
+        import subprocess
+        card = tmp_path / "card.png"  # cream card
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=0xf3eee3:s=1080x1920",
+                        "-frames:v", "1", str(card)], check=True)
+        clip = tmp_path / "clip.mp4"  # 2 s of a moving pattern, 640x960
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                        "testsrc2=size=640x960:rate=30:duration=2", "-pix_fmt", "yuv420p", str(clip)], check=True)
+        mask = tmp_path / "mask.png"  # the box, white inside a 20 px black border (the torn edge)
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=black:s=400x600",
+                        "-vf", "drawbox=x=20:y=20:w=360:h=560:color=white:t=fill", "-frames:v", "1", str(mask)],
+                       check=True)
+        url = lambda p, mime: f"data:{mime};base64," + base64.b64encode(p.read_bytes()).decode()
+        spec = rr.CardClip(video=url(clip, "video/mp4"), mask=url(mask, "image/png"),
+                           x=340, y=700, w=400, h=600, sx=0, sy=0, sw=640, sh=960)
+        return card, spec
+
+    def _pixel(self, video: Path, t: float, x: int, y: int) -> tuple:
+        import subprocess
+        raw = subprocess.run(["ffmpeg", "-loglevel", "error", "-ss", f"{t}", "-i", str(video), "-frames:v", "1",
+                              "-vf", f"crop=1:1:{x}:{y},format=rgb24", "-f", "rawvideo", "-"],
+                             capture_output=True, check=True).stdout
+        return tuple(raw)
+
+    def test_the_clip_plays_inside_the_torn_frame_and_the_card_stays(self, tmp_path: Path):
+        card, spec = self._files(tmp_path)
+        out = rr.card_clip_video(card, spec, tmp_path / "clip-1")
+        assert abs(rr.probe_duration(out) - 2.0) < 0.1
+        cream = self._pixel(out, 0.5, 50, 50)
+        assert all(abs(a - b) < 8 for a, b in zip(cream, (0xF3, 0xEE, 0xE3)))  # the paper outside the box
+        assert self._pixel(out, 0.5, 345, 705) == self._pixel(out, 1.5, 345, 705)  # torn edge: still paper
+        inside = [self._pixel(out, t, 540, 1000) for t in (0.2, 1.2)]
+        assert inside[0] != inside[1]  # the clip moves inside the frame
+
+    def test_a_long_clip_loops_on_its_first_part_at_its_own_speed(self, tmp_path: Path):
+        import subprocess
+        src = tmp_path / "long.mp4"  # 3 s, for a 2 s loop scene: one there-and-back of its first 1 s
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                        "testsrc2=size=320x568:rate=30:duration=3", "-pix_fmt", "yuv420p", str(src)], check=True)
+        out = rr.ping_pong_clip(src.read_bytes(), ".mp4", 2.0, tmp_path / "clip-2")
+        assert abs(rr.probe_duration(out) - 2.0) < 0.05
+        # Frame 30 (the turn) is about the source's frame 29 (~1 s in, retimed by a frame to fit), not
+        # frame 85 (where the whole 3 s squeezed into 1 s would be): its first part at its own speed.
+        def frame(video: Path, n: int, name: str) -> Path:
+            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(video), "-vf", f"select=eq(n\\,{n})",
+                            "-frames:v", "1", str(tmp_path / name)], check=True)
+            return tmp_path / name
+
+        def psnr(a: Path, b: Path) -> float:
+            import re
+            proc = subprocess.run(["ffmpeg", "-i", str(a), "-i", str(b), "-lavfi", "psnr", "-f", "null", "-"],
+                                  capture_output=True, text=True)
+            value = re.findall(r"average:(\S+)", proc.stderr)[-1]
+            return 99.0 if value == "inf" else float(value)
+
+        turn = frame(out, 30, "t.png")
+        assert psnr(turn, frame(src, 29, "s29.png")) > 30
+        assert psnr(turn, frame(src, 85, "s85.png")) < 25

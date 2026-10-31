@@ -245,6 +245,8 @@ interface Cut {
   transition_in?: string;
   transition_out?: string;
   transition_duration?: number;
+  // A video cut that takes the camera move in `animation` (a clip placed in a card moves with it).
+  animateVideo?: boolean;
   transform?: {
     animation?: string;
     scale?: number;
@@ -346,6 +348,39 @@ const Vignette: React.FC = () => (
 // Enhanced Image Scene — spring physics, parallax, variety
 // ---------------------------------------------------------------------------
 
+// The camera move of a still (and of a card clip, which moves with its card), from 0 to 1 through the scene.
+const cameraMove = (anim: string, progress: number) => {
+  let scale = 1;
+  let translateX = 0;
+  let translateY = 0;
+  if (anim === "zoom-in") {
+    scale = 1 + progress * 0.18;
+  } else if (anim === "breathe") {
+    // In and back out, easing at both ends: the last frame matches the first, so a loop reel replays
+    // without a jump (Character Studio's loop cards).
+    scale = 1 + 0.09 * (1 - Math.cos(2 * Math.PI * progress));
+  } else if (anim === "zoom-out") {
+    scale = 1.18 - progress * 0.18;
+  } else if (anim === "pan-left") {
+    translateX = interpolate(progress, [0, 1], [40, -40]);
+    scale = 1.15;
+  } else if (anim === "pan-right") {
+    translateX = interpolate(progress, [0, 1], [-40, 40]);
+    scale = 1.15;
+  } else if (anim === "ken-burns" || anim === "ken-burns-slow-zoom") {
+    // Cinematic Ken Burns: gentle zoom + diagonal drift
+    scale = 1 + progress * 0.22;
+    translateX = interpolate(progress, [0, 1], [0, -25]);
+    translateY = interpolate(progress, [0, 1], [0, -15]);
+  } else if (anim === "parallax") {
+    // Subtle parallax — foreground moves faster
+    translateY = interpolate(progress, [0, 1], [15, -15]);
+    scale = 1.1;
+  }
+  // "static" or "none" → just display
+  return { scale, translateX, translateY };
+};
+
 const ImageScene: React.FC<{
   src: string;
   animation?: string;
@@ -379,9 +414,6 @@ const ImageScene: React.FC<{
         extrapolateRight: "clamp",
       });
 
-  let scale = 1;
-  let translateX = 0;
-  let translateY = 0;
   const anim = animation || "zoom-in";
 
   // Progress with easing — smoother than linear
@@ -389,32 +421,7 @@ const ImageScene: React.FC<{
     extrapolateLeft: "clamp",
     extrapolateRight: "clamp",
   });
-
-  if (anim === "zoom-in") {
-    scale = 1 + progress * 0.18;
-  } else if (anim === "breathe") {
-    // In and back out, easing at both ends: the last frame matches the first, so a loop reel replays
-    // without a jump (Character Studio's loop cards).
-    scale = 1 + 0.09 * (1 - Math.cos(2 * Math.PI * progress));
-  } else if (anim === "zoom-out") {
-    scale = 1.18 - progress * 0.18;
-  } else if (anim === "pan-left") {
-    translateX = interpolate(progress, [0, 1], [40, -40]);
-    scale = 1.15;
-  } else if (anim === "pan-right") {
-    translateX = interpolate(progress, [0, 1], [-40, 40]);
-    scale = 1.15;
-  } else if (anim === "ken-burns" || anim === "ken-burns-slow-zoom") {
-    // Cinematic Ken Burns: gentle zoom + diagonal drift
-    scale = 1 + progress * 0.22;
-    translateX = interpolate(progress, [0, 1], [0, -25]);
-    translateY = interpolate(progress, [0, 1], [0, -15]);
-  } else if (anim === "parallax") {
-    // Subtle parallax — foreground moves faster
-    translateY = interpolate(progress, [0, 1], [15, -15]);
-    scale = 1.1;
-  }
-  // "static" or "none" → just display
+  const { scale, translateX, translateY } = cameraMove(anim, progress);
 
   return (
     <AbsoluteFill style={{ overflow: "hidden", background: "#0F172A" }}>
@@ -447,10 +454,13 @@ const VideoScene: React.FC<{
   transitionDuration?: number;
   sceneDurationSeconds: number;
   backgroundColor?: string;
+  // The camera move, only when asked (a card clip moves with its card); other clips play as they are.
+  animation?: string;
 }> = ({
   src,
   startFrom = 0,
   vignette = true,
+  animation,
   transitionIn,
   transitionOut,
   transitionDuration,
@@ -481,8 +491,12 @@ const VideoScene: React.FC<{
         extrapolateRight: "clamp",
       });
 
+  const move = animation
+    ? cameraMove(animation, interpolate(frame, [0, durationInFrames], [0, 1], { extrapolateLeft: "clamp", extrapolateRight: "clamp" }))
+    : null;
+
   return (
-    <AbsoluteFill style={{ background: backgroundColor }}>
+    <AbsoluteFill style={{ background: backgroundColor, overflow: "hidden" }}>
       <OffthreadVideo
         src={resolveAsset(src)}
         startFrom={Math.round(startFrom * fps)}
@@ -491,6 +505,7 @@ const VideoScene: React.FC<{
           height: "100%",
           objectFit: "cover",
           opacity: fadeIn * fadeOut,
+          ...(move ? { transform: `scale(${move.scale}) translate(${move.translateX}px, ${move.translateY}px)` } : {}),
         }}
         muted
       />
@@ -797,6 +812,7 @@ const SceneRenderer: React.FC<{ cut: Cut; theme: ThemeConfig }> = ({ cut, theme 
         transitionDuration={cut.transition_duration}
         sceneDurationSeconds={cut.out_seconds - cut.in_seconds}
         backgroundColor={cut.backgroundColor}
+        animation={cut.animateVideo ? animation : undefined}
       />,
     );
   }
