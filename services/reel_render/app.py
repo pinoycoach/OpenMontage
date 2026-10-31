@@ -148,6 +148,24 @@ LAST_LINE_HOLD = 0.5
 # in frame 1, no fade-in). The composer's default is a spring fade-in, so "cut" has to be explicit.
 
 
+class CardClip(BaseModel):
+    """A clip placed into a still card (Character Studio's paper quote card): `image` is the card with
+    its paper, quote and torn frame; the clip's crop (sx, sy, sw, sh, in clip pixels) is scaled into the
+    box (x, y, w, h, on the 1080x1920 card) and cut to the torn edge by `mask` (a PNG the box's size,
+    white where the clip shows). Done here, frame by frame, instead of recording the card in the browser,
+    which stuttered and froze on real laptops (31 Oct 2026)."""
+    video: str
+    mask: str
+    x: int = Field(ge=0, le=4000)
+    y: int = Field(ge=0, le=4000)
+    w: int = Field(gt=0, le=4000)
+    h: int = Field(gt=0, le=4000)
+    sx: float = Field(0, ge=0)
+    sy: float = Field(0, ge=0)
+    sw: float = Field(gt=0)
+    sh: float = Field(gt=0)
+
+
 class Scene(BaseModel):
     image: str
     durationSeconds: float = Field(4, gt=0, le=60)
@@ -161,6 +179,9 @@ class Scene(BaseModel):
     # A ready-made clip for this scene (video data URL, e.g. an approved AI shot). It plays instead of
     # the image; when it's shorter than the scene, its last frame is held so the frame never goes empty.
     video: Optional[str] = None
+    # Or a clip that plays inside the still card `image` (see CardClip). It moves with the card's camera
+    # move, and a clip shorter than the scene goes there and back instead of freezing on its last frame.
+    cardClip: Optional[CardClip] = None
     captionPosition: CaptionPosition = "low"
 
 
@@ -877,6 +898,30 @@ def video_response(path: Path, filename: str, headers: Optional[dict] = None) ->
         **(headers or {})})
 
 
+def card_clip_video(card_image: Path, clip: CardClip, stem: Path) -> Path:
+    """The card with its clip playing in the torn frame, as a video the clip's length (CardClip)."""
+    raw, ext = decode_data_url(clip.video, "video/")
+    src = stem.with_name(f"{stem.name}-src{ext or '.mp4'}")
+    src.write_bytes(raw)
+    mraw, _ = decode_data_url(clip.mask, "image/")
+    mask = stem.with_name(f"{stem.name}-mask.png")
+    mask.write_bytes(mraw)
+    out = stem.with_name(f"{stem.name}-card.mp4")
+    graph = (f"[1:v]fps=30,crop={clip.sw:.2f}:{clip.sh:.2f}:{clip.sx:.2f}:{clip.sy:.2f},scale={clip.w}:{clip.h},"
+             "setsar=1,format=yuva420p[c];"
+             f"[2:v]scale={clip.w}:{clip.h},format=gray[m];"
+             "[c][m]alphamerge[cm];"
+             "[0:v]scale=1080:1920,setsar=1,format=yuv420p[bg];"
+             f"[bg][cm]overlay={clip.x}:{clip.y}:shortest=1:format=auto,format=yuv420p[v]")
+    proc = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-loop", "1", "-framerate", "30", "-i", str(card_image),
+                           "-i", str(src), "-i", str(mask), "-filter_complex", graph, "-map", "[v]", "-an",
+                           "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", str(out)],
+                          capture_output=True, text=True, timeout=300)
+    if proc.returncode != 0 or not out.exists():
+        raise HTTPException(400, f"That card clip can't be placed in the card: {proc.stderr[-300:]}")
+    return out
+
+
 def ping_pong_clip(raw: bytes, ext: str, seconds: float, stem: Path) -> Path:
     """A loop reel's clip: played forward, then backward, repeated to fill the scene, so its end runs on
     into its start and the platform's replay shows no jump (the Hermit card's Omni push-in snapped back
@@ -891,11 +936,15 @@ def ping_pong_clip(raw: bytes, ext: str, seconds: float, stem: Path) -> Path:
         raise HTTPException(400, "That scene clip can't be read.")
     out = stem.parent / f"{stem.name}-pingpong.mp4"
     frames = max(4, round(seconds * 30))
-    trips = max(1, round(seconds / (2 * have)))
+    # The fewest there-and-backs the clip is long enough for; a longer clip plays its first part at its
+    # own speed (a whole 9 s Omni clip squeezed into 4 s would rush).
+    trips = max(1, math.ceil(seconds / (2 * have) - 0.25))  # up to about a fifth slower, rather than two trips
     m = max(2, round(frames / (2 * trips)) + 1)  # frames in the forward half, both ends included
-    stretch = m / 30 / have
+    used = min(have, seconds / (2 * trips))
+    stretch = m / 30 / used
     proc = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(src), "-an", "-filter_complex",
-                           f"[0:v]setpts={stretch:.6f}*PTS,fps=30,trim=end_frame={m},setpts=PTS-STARTPTS,split[f][b];"
+                           f"[0:v]trim=duration={used:.3f},setpts=PTS-STARTPTS,"
+                           f"setpts={stretch:.6f}*PTS,fps=30,trim=end_frame={m},setpts=PTS-STARTPTS,split[f][b];"
                            f"[b]reverse,trim=start_frame=1:end_frame={m - 1},setpts=PTS-STARTPTS[r];"
                            "[f][r]concat=n=2:v=1,loop=loop=-1:size=32767,"
                            f"trim=end_frame={frames},setpts=PTS-STARTPTS[v]",
@@ -1000,11 +1049,18 @@ def render_reel(req: RenderRequest, background: BackgroundTasks) -> StreamingRes
         heard = transcribe(voice_path) if voice_path else None
         props = build_props(req, image_paths, voice_path, voice_seconds, heard)
         for i, scene in enumerate(req.scenes):
-            if scene.video:
+            cut = props["cuts"][i]
+            seconds = cut["out_seconds"] - cut["in_seconds"]
+            stem = job_dir / f"clip-{i + 1}"
+            if scene.cardClip:
+                card = card_clip_video(image_paths[i], scene.cardClip, stem)
+                raw, have = card.read_bytes(), probe_duration(card) or 0.0
+                # Shorter than the scene (or a loop): there and back, never frozen on its last frame.
+                clip = ping_pong_clip(raw, ".mp4", seconds, stem) if req.loop or have < seconds else fit_clip(raw, ".mp4", seconds, stem)
+                cut["source"] = clip.name
+                cut["animateVideo"] = True  # the card's camera move applies to the clip too
+            elif scene.video:
                 raw, ext = decode_data_url(scene.video, "video/")
-                cut = props["cuts"][i]
-                seconds = cut["out_seconds"] - cut["in_seconds"]
-                stem = job_dir / f"clip-{i + 1}"
                 clip = ping_pong_clip(raw, ext, seconds, stem) if req.loop else fit_clip(raw, ext, seconds, stem)
                 cut["source"] = clip.name
         # Taken before fal is called, so a request that is turned away has paid for nothing.
